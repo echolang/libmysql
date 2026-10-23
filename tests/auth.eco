@@ -1,0 +1,104 @@
+use mysql::auth::{native, cachingSha2, unbase64, Big, PublicKey, publicKey, encrypt};
+
+// a throwaway 2048 bit key made with openssl for these tests; the vectors were computed
+// independently in python (hashlib and its big integers)
+internal const string PUB = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxLRlRKotRLDC9l2AgrNM\nBuNKL9m4L81jgW3p4sbb3asmLDPkYU3Aw1zdmD6FGDLcLTc1Tj2VzqG5GXFUJzcU\nfj00LbBXDnmDGQl0SeyxhRfWCbfYIwySTCaEbzquA7wRhiq3J8wlpPgMNz2WgOXH\nQzP2W2PaMBqkw4b9/XN0Fsppo1MjDbGK/ouPH8Jb1K+rS9DWB47gQqHzwPWea4/5\nNvtqDYyclc1WodImK5Jawoyzedt8OQi29wIRx8CdWvi3rKrsSk6s464F1ahhVAOW\na5zisTghLCSIEilVje7KuB+XF0tQSfk5l45HfA2WQ+Ob3dlmlESYsiBPHdxESxjx\niQIDAQAB\n-----END PUBLIC KEY-----\n";
+internal const string RSA_PUB = "-----BEGIN RSA PUBLIC KEY-----\nMIIBCgKCAQEAxLRlRKotRLDC9l2AgrNMBuNKL9m4L81jgW3p4sbb3asmLDPkYU3A\nw1zdmD6FGDLcLTc1Tj2VzqG5GXFUJzcUfj00LbBXDnmDGQl0SeyxhRfWCbfYIwyS\nTCaEbzquA7wRhiq3J8wlpPgMNz2WgOXHQzP2W2PaMBqkw4b9/XN0Fsppo1MjDbGK\n/ouPH8Jb1K+rS9DWB47gQqHzwPWea4/5NvtqDYyclc1WodImK5Jawoyzedt8OQi2\n9wIRx8CdWvi3rKrsSk6s464F1ahhVAOWa5zisTghLCSIEilVje7KuB+XF0tQSfk5\nl45HfA2WQ+Ob3dlmlESYsiBPHdxESxjxiQIDAQAB\n-----END RSA PUBLIC KEY-----\n";
+
+internal function salt() : string
+{
+    string $s = '';
+    foreach (1 ..= 20 as $i) {
+        $s->push(byteOf($i));
+    }
+    return $s;
+}
+
+internal function key() : PublicKey
+{
+    PublicKey $k = guard publicKey(PUB) else ($e) {
+        die("pem: {$e}");
+    }
+    return $k;
+}
+
+test native_password_proof
+{
+    assert(crypto::hex(native('secret', salt())) == 'b32bb3a583e1340c0a1108d58b1be49781ad8c2f');
+    assert(native('', salt())->empty());
+}
+
+test caching_sha2_fast_proof
+{
+    assert(crypto::hex(cachingSha2('secret', salt())) == '746ebe205d56a0707acb3e796e834e0dd7b1d61743b26bd5202c7a623230c7c9');
+    assert(cachingSha2('', salt())->empty());
+}
+
+test base64_decodes_with_line_breaks
+{
+    string $raw = guard unbase64("aGVs\nbG8gd29y\r\nbGQ=");
+    assert($raw == 'hello world');
+    assert(unbase64('a*b') == null);
+}
+
+test both_pem_shapes_give_the_same_key
+{
+    PublicKey $spki = key();
+    PublicKey $pkcs1 = guard publicKey(RSA_PUB) else ($e) {
+        die("pem: {$e}");
+    }
+    assert($spki->size() == 256);
+    assert($spki->n->compare($pkcs1->n) == 0);
+    assert($spki->e->compare(Big(small: 65537)) == 0);
+    assert(publicKey('nope')->failed());
+}
+
+test modexp_matches_python
+{
+    PublicKey $k = key();
+    string $a = '';
+    foreach (1 .. 200 as $i) {
+        $a->push(byteOf($i));
+    }
+    Big $c = Big(bytes: $a)->power($k->e, $k->n);
+    assert(crypto::hex($c->bytes(256)) == '6694a1fef1dd42728d6963693fa550e58eca08dff2373cd6c846efea41413b4579b744e8c6a9d22cc5dc6ab522f36a424483bfe0069041af5b6a7dca22f41baf8a35703928fe89184887ec6d3516796c16369720bda0cea5df37d0eb98a207f749d7e3000afe8a9deee1b563821f018ea3270c825adbd16dc4bd22479f4a13762c72c268404838595e91c558f6f21b2b4870c05cbdc53d38908b3c36543e5cabaeea6bb97e5ad9fddf43e734242322d007b9ed469d76401f0bd6032559ae90ee9740347f413b7521a5373749289617b6381ea479986b1917aecd4d4ddf9d3af642dbc27853f7c7a9f1dd4471d0275a5e0183b89c3b6c7851dbe81547a2e5432f');
+}
+
+test modexp_with_a_full_size_exponent
+{
+    // the private exponent: 2048 bits of square and multiply exercises every path of the division
+    PublicKey $k = key();
+    string $a = '';
+    foreach (1 .. 200 as $i) {
+        $a->push(byteOf($i));
+    }
+    string $d = guard crypto::unhex('1daec12752ecc0d4519f3eadd14b401a3bfb2a6c56c473e0639c13f2a22274794aa9d9ecc9182411f6f6036ecfc3be8d060fb22e0bd20adbd1a43abb41ada89c821cd9162694eb1632d57fe455e0d5de2a70cdfac213381260af945f4cfa084bb6acc475af7330c93382b47afd196f6fbf2c1a4f5f91e9bb5a3c0920d166bfb768c40fbc0078fed48b6fc2fe00f1290fb4947fe7366b7811ec2ed5b04c2a901de1e06473e8b0c97f618d694f07138c5120edfc813480639c52bb22653e18f82003df36024334284584fd1a12c60e7b2dfc176727aea17e04196044cfa793fda3b4ffd8790817a7a6a4f81c92eed2d3ab19bc52c533da50208e40109ac3af089f');
+    Big $c = Big(bytes: $a)->power(Big(bytes: $d), $k->n);
+    assert(crypto::hex($c->bytes(256)) == '3aca2ea79be437f583c07997c8d85ee9297c812e230b74df6a826ff9b6c7b8e08bd2ee203468a908325a93854902a0a33d582adea795f853df20b9937f48bbac5431453a7012dab3fac35a7de195ea44f09dd67433bc8a85fccfdb452f362a0d2091d53f60ccc5637b4a5e69ec761417b580988a2d645e7baea6c60849fee8457a1006b6ef6416caa343e2fce1e168bb6e0fb4301d4cf2cdb3008454991dc1b7349136ac67c22197173d8f26173281cfb5493507ba0eb521daa9a8f11aa17fae4da96f44fee44f00106c71d23352929b465761c5b5322459a37b5edf3fa27d5f928adce0cca069ef9a9277814377d3c69f0ad3edb2163d5f6a5172133efec2f2');
+}
+
+test oaep_matches_python_with_a_fixed_seed
+{
+    string $seed = '';
+    foreach (100 .. 120 as $i) {
+        $seed->push(byteOf($i));
+    }
+    string $message = 'secret';
+    $message->push(0);
+    string $masked = mysql::auth::xor($message, salt());
+    string $c = guard encrypt(key(), $masked, $seed) else ($e) {
+        die($e);
+    }
+    assert(crypto::hex($c) == '86ccca56ae79f489f20c9410ab8e17ce8e6859dc5c5a8d1d748cc8e1e1eeea8120d7e3da434f6d2439b166dd09c26bb9cee373254fbe206aea62ed7e56630e67050c1c89bc616d0af32a67d6fdaf1082d345456e3de3b7b8ecbfb0fcb21971ed5e460494e6abd7f7cd8f8a08ba511996cf64532e9b98afdd2a7e732c114deb59711f5e61fa5fb599aa18723d9312d9cda7da015a913ce5b14e0e4c0cdf2e759ce6ed0bca2a739855975986c8ae4535659eedf0b0ba8683eea3b1600ab3863b1d349f8c19ff9dd3de1c41189e9e1db94c4757d7cedfd9c214f09a79b4d699f5c7d3b4ff6099ee2e1f2cd15abaefe6853fe1b90fb04e2c60869d7d3ed38999ec85');
+}
+
+test oaep_refuses_a_message_too_long
+{
+    string $long = str::repeat('x', 215);
+    assert(encrypt(key(), $long)->failed());
+}
+
+internal function byteOf(int32 $i) : uint8
+{
+    return $i as uint8;
+}

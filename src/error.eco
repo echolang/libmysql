@@ -1,0 +1,273 @@
+namespace mysql;
+
+/**
+ * The server's error number. Codes a program branches on have names; every other one is `other`
+ * and still carries its number in `value()`.
+ */
+public enum ErrorCode : uint16
+{
+    case tooManyConnections = 1040;
+    case databaseAccessDenied = 1044;
+    case accessDenied = 1045;
+    case noDatabase = 1046;
+    case badNull = 1048;
+    case badDatabase = 1049;
+    case tableExists = 1050;
+    case badTable = 1051;
+    case serverShutdown = 1053;
+    case badField = 1054;
+    case dupEntry = 1062;
+    case parse = 1064;
+    case noSuchTable = 1146;
+    case lockWaitTimeout = 1205;
+
+    /**
+     * Deadlock. The server rolled the statement back.
+     */
+    case deadlock = 1213;
+    case outOfRange = 1264;
+    case readOnly = 1290;
+    case queryInterrupted = 1317;
+    case dataTooLong = 1406;
+
+    /**
+     * Cannot delete or update: a foreign key references this row.
+     */
+    case rowIsReferenced = 1451;
+
+    /**
+     * Cannot add or update: a foreign key does not match.
+     */
+    case noReferencedRow = 1452;
+    case readOnlyTransaction = 1792;
+    case queryTimeout = 3024;
+    case clientInactivity = 4031;
+
+    /**
+     * A code this library does not name. `value()` is the server's number.
+     */
+    case other;
+}
+
+/**
+ * An error packet from the server: its code, the five character SQLSTATE, and its message.
+ */
+public struct ServerError
+{
+    public const ErrorCode $code;
+
+    /**
+     * The five-character SQLSTATE (`23000`, `40001`, `HY000`).
+     */
+    public const string $state;
+    public const string $message;
+}
+
+/**
+ * Why a login could not be completed on this side.
+ */
+public enum AuthError
+{
+    /**
+     * The server asked for an authentication plugin this client does not speak.
+     */
+    case unsupported(string $plugin);
+
+    /**
+     * The plugin sends the password as it is. Only over a unix socket.
+     */
+    case needsSecureTransport;
+
+    /**
+     * Full caching_sha2_password or sha256_password over TCP needs the server's RSA public key:
+     * set `Options->serverKey`, or allow `Options->fetchServerKey`.
+     */
+    case needsServerKey;
+
+    /**
+     * The server's public key could not be read.
+     */
+    case badKey(string $why);
+
+    /**
+     * The sentence: which plugin, or what to set.
+     */
+    public const function message() : string
+    {
+        return match ($this) {
+            AuthError::unsupported($p) => "the server asked for the '{$p}' authentication plugin, which is not supported",
+            AuthError::needsSecureTransport => 'this authentication plugin sends the password as it is: connect over a unix socket',
+            AuthError::needsServerKey => 'full authentication over TCP needs the server public key: set Options->serverKey, or Options->fetchServerKey = true',
+            AuthError::badKey($w) => "the server public key: {$w}",
+        };
+    }
+}
+
+#[docs::see: ["mysql::ErrorCode", "mysql::ServerError"]]
+
+/**
+ * What can go wrong talking to MySQL. Cases a caller branches on: the server said no (`server`),
+ * the connection is gone (`transport`, `timeout`, `closed`), login failed on this side (`auth`),
+ * or the call itself was wrong (`invalid`). `"{$e}"` is the sentence.
+ *
+ * ```echo
+ * guard $db->exec($sql) else ($e) {
+ *     if ($e->is(.dupEntry)) {
+ *         echo $e->name();    // server
+ *     }
+ * }
+ * ```
+ */
+public enum Error
+{
+    /**
+     * The server refused the command, with its own code and message.
+     */
+    case server(ServerError $error);
+
+    /**
+     * The socket failed: refused, reset, closed by the peer, and so on.
+     */
+    case transport(tcp::Error $error);
+
+    /**
+     * The deadline passed first. Mid-command, the connection closes: leftover bytes could not be
+     * told apart from the next answer.
+     */
+    case timeout;
+
+    /**
+     * The connection is closed, or an earlier failure left it unusable.
+     */
+    case closed;
+
+    /**
+     * A streaming result is still open on this connection: finish it first.
+     */
+    case busy;
+
+    /**
+     * Login failed on this side: unsupported plugin, needs a key, needs a socket, or a bad key.
+     */
+    case auth(AuthError $error);
+
+    /**
+     * The server sent something that does not parse as the protocol.
+     */
+    case malformed(string $why);
+
+    /**
+     * A packet over `Options->maxPacket`.
+     */
+    case tooLarge(uint64 $size);
+
+    /**
+     * The server asked for a local file. This client never sends one.
+     */
+    case localInfile;
+
+    /**
+     * The call could not be made as written: a value without a placeholder, a placeholder
+     * without a value, a URL that does not parse.
+     */
+    case invalid(string $why);
+
+    /**
+     * No pooled connection came free before the deadline.
+     */
+    case exhausted;
+
+    /**
+     * True when the server answered with `$code`.
+     */
+    public const function is(ErrorCode $code) : bool
+    {
+        match ($this) {
+            Error::server($s) => {
+                return $s->code == $code;
+            },
+            else => {
+                return false;
+            },
+        }
+    }
+
+    /**
+     * The server's code, or null when the error did not come from the server.
+     */
+    public const function code() : ErrorCode?
+    {
+        match ($this) {
+            Error::server($s) => {
+                ErrorCode? $c = $s->code;
+                return $c;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * The five-character SQLSTATE the server sent (`23000` for a duplicate key, `40001` for a
+     * deadlock), or null when the error did not come from the server.
+     */
+    public const function state() : string?
+    {
+        match ($this) {
+            Error::server($s) => {
+                string? $st = $s->state;
+                return $st;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * True when running the same work again may succeed: a deadlock or a lock wait timeout. The
+     * server rolled the statement (or the transaction) back.
+     */
+    public const function retryable() : bool
+    {
+        return $this->is(.deadlock) || $this->is(.lockWaitTimeout);
+    }
+
+    /**
+     * The case's name: `server`, `timeout` and so on. For a log line or a test.
+     */
+    public const function name() : string
+    {
+        return match ($this) {
+            Error::server($s) => 'server',
+            Error::transport($t) => 'transport',
+            Error::timeout => 'timeout',
+            Error::closed => 'closed',
+            Error::busy => 'busy',
+            Error::auth($a) => 'auth',
+            Error::malformed($w) => 'malformed',
+            Error::tooLarge($n) => 'tooLarge',
+            Error::localInfile => 'localInfile',
+            Error::invalid($w) => 'invalid',
+            Error::exhausted => 'exhausted',
+        };
+    }
+
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::server($s) => "{$s->code->value()} ({$s->state}): {$s->message}",
+            Error::transport($t) => $t->message(),
+            Error::timeout => 'timed out',
+            Error::closed => 'the connection is closed',
+            Error::busy => 'a streaming result is still open on this connection',
+            Error::auth($a) => $a->message(),
+            Error::malformed($w) => "malformed packet: {$w}",
+            Error::tooLarge($n) => "a packet of {$n} bytes is over the limit",
+            Error::localInfile => 'the server asked for a local file, which this client never sends',
+            Error::invalid($w) => $w,
+            Error::exhausted => 'no pooled connection came free in time',
+        };
+    }
+}

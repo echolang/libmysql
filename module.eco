@@ -1,0 +1,23 @@
+/*
+ * libmysql: a MySQL client for Echo.
+ *
+ * The client/server protocol is written in Echo over libtcp: the handshake,
+ * caching_sha2_password (RSA-OAEP included) and mysql_native_password, the
+ * text and binary protocols, prepared statements, streaming, multi-results
+ * and a connection pool. Hashes and randomness come from libcrypto. No C,
+ * no libmysqlclient, no TLS yet.
+ */
+
+#[module: "libmysql"]
+#[version: "0.1.0"] // x-release-please-version
+#[epm::license: "MIT"]
+#[epm::description: "a mysql client for echolang, written in echo over libtcp"]
+
+#[requires: "echolang/libtcp" { version: "^0.2", source: git "https://github.com/echolang/libtcp" }]
+#[requires: "echolang/libcrypto" { version: "^0.3", source: git "https://github.com/echolang/libcrypto" }]
+
+#[sources: ["src/*.eco", "src/protocol/*.eco", "src/auth/*.eco"]]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+}

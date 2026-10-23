@@ -1,0 +1,343 @@
+namespace mysql;
+
+use std::time;
+
+/**
+ * How to reach the server and how to behave once there. Plain data: fields with defaults, set by
+ * name at construction or by assignment.
+ */
+public struct Options
+{
+    public string $host = '127.0.0.1';
+    public uint16 $port = 3306;
+
+    /**
+     * A unix socket path. When set, `host` and `port` are not used.
+     */
+    public string? $socket = null;
+
+    public string $user = 'root';
+
+    /**
+     * Empty is a password, not "no password".
+     */
+    public string $password = '';
+
+    public string? $database = null;
+
+    /**
+     * How long connecting and logging in may take, together.
+     */
+    public time::duration $connectTimeout = time::duration::secs(10);
+
+    /**
+     * How long one command may take when the call names no deadline. Null waits forever.
+     */
+    public time::duration? $timeout = null;
+
+    /**
+     * The connection's collation. 45 is utf8mb4_general_ci, which MySQL 5.7, 8, 9 and MariaDB all
+     * know.
+     */
+    public uint8 $collation = 45;
+
+    /**
+     * The largest payload accepted from the server or sent to it.
+     */
+    public usize $maxPacket = 67108864;
+
+    /**
+     * Allow several statements in one query string. Off by default: this is what turns an
+     * injection into a second statement.
+     */
+    public bool $multiStatements = false;
+
+    /**
+     * The server's RSA public key (PEM), for full caching_sha2_password authentication over TCP.
+     */
+    public string? $serverKey = null;
+
+    /**
+     * Ask the server for its public key when none is set. Off by default, same as MySQL's own
+     * clients: over plain TCP the key itself could be swapped by someone in between.
+     */
+    public bool $fetchServerKey = false;
+
+    /**
+     * How many prepared statements a connection keeps for SQL it has seen.
+     */
+    public usize $statementCache = 64;
+
+    /**
+     * Options from a URL: `mysql://user:password@host:port/database?socket=/path&timeout=5s`.
+     * User, password and database are percent-decoded. Query keys: `socket`, `timeout`,
+     * `connectTimeout` (`250ms`, `5s`, `2m`), `multiStatements`, `fetchServerKey`,
+     * `statementCache`, `maxPacket`, `collation`.
+     */
+    public static function parse(const string& $url) : result<Options, Error>
+    {
+        Options $o = Options();
+        string $scheme = 'mysql://';
+        if (!$url->starts($scheme)) {
+            return .error(.invalid('a MySQL URL starts with mysql://'));
+        }
+        string $rest = $url->sub($scheme->size(), $url->size() - $scheme->size());
+
+        string $query = '';
+        usize $q = $rest->find('?');
+        if ($q < $rest->size()) {
+            $query = $rest->sub($q + 1, $rest->size() - $q - 1);
+            $rest = $rest->sub(0, $q);
+        }
+
+        string $path = '';
+        usize $slash = $rest->find('/');
+        if ($slash < $rest->size()) {
+            $path = $rest->sub($slash + 1, $rest->size() - $slash - 1);
+            $rest = $rest->sub(0, $slash);
+        }
+        if (!$path->empty()) {
+            string $db = guard unescape($path) else {
+                return .error(.invalid('the database name is not valid percent-encoding'));
+            }
+            $o->database = $db;
+        }
+
+        // the last '@' ends the user info, so an unescaped '@' in the password still works
+        usize $at = $rest->size();
+        usize $scan = 0;
+        while ($scan < $rest->size()) {
+            if ($rest->byte($scan) == 64) {
+                $at = $scan;
+            }
+            $scan = $scan + 1;
+        }
+        if ($at < $rest->size()) {
+            string $auth = $rest->sub(0, $at);
+            $rest = $rest->sub($at + 1, $rest->size() - $at - 1);
+            usize $colon = $auth->find(':');
+            string $user = $auth;
+            if ($colon < $auth->size()) {
+                $user = $auth->sub(0, $colon);
+                string $pass = guard unescape($auth->sub($colon + 1, $auth->size() - $colon - 1)) else {
+                    return .error(.invalid('the password is not valid percent-encoding'));
+                }
+                $o->password = $pass;
+            }
+            string $u = guard unescape($user) else {
+                return .error(.invalid('the user is not valid percent-encoding'));
+            }
+            $o->user = $u;
+        }
+
+        if (!$rest->empty()) {
+            string $host = $rest;
+            if ($rest->starts('[')) {
+                usize $close = $rest->find(']');
+                if ($close == $rest->size()) {
+                    return .error(.invalid('an IPv6 host without its closing bracket'));
+                }
+                $host = $rest->sub(1, $close - 1);
+                string $after = $rest->sub($close + 1, $rest->size() - $close - 1);
+                if (!$after->empty()) {
+                    if (!$after->starts(':')) {
+                        return .error(.invalid("'{$after}' after the host"));
+                    }
+                    uint16 $p6 = guard port($after->sub(1, $after->size() - 1)) else ($e) {
+                        return .error($e);
+                    }
+                    $o->port = $p6;
+                }
+            } else {
+                usize $colon = $rest->find(':');
+                if ($colon < $rest->size()) {
+                    $host = $rest->sub(0, $colon);
+                    uint16 $p = guard port($rest->sub($colon + 1, $rest->size() - $colon - 1)) else ($e) {
+                        return .error($e);
+                    }
+                    $o->port = $p;
+                }
+            }
+            if (!$host->empty()) {
+                $o->host = $host;
+            }
+        }
+
+        if (!$query->empty()) {
+            foreach (str::split($query, '&')->owned() as $pair) {
+                if ($pair->empty()) {
+                    continue;
+                }
+                usize $eq = $pair->find('=');
+                string $key = $pair;
+                string $raw = '';
+                if ($eq < $pair->size()) {
+                    $key = $pair->sub(0, $eq);
+                    $raw = $pair->sub($eq + 1, $pair->size() - $eq - 1);
+                }
+                string $value = guard unescape($raw) else {
+                    return .error(.invalid("the value of '{$key}' is not valid percent-encoding"));
+                }
+                guard $o->option($key, $value) else ($e) {
+                    return .error($e);
+                }
+            }
+        }
+        return .ok($o);
+    }
+
+    /**
+     * Set one option by its URL name.
+     */
+    private function option(const string& $key, const string& $value) : status<Error>
+    {
+        if ($key == 'socket') {
+            $this->socket = $value;
+            return .ok;
+        }
+        if ($key == 'timeout') {
+            time::duration $t = guard duration($value) else {
+                return .error(.invalid("timeout '{$value}' is not a duration like 500ms or 5s"));
+            }
+            $this->timeout = $t;
+            return .ok;
+        }
+        if ($key == 'connectTimeout') {
+            time::duration $c = guard duration($value) else {
+                return .error(.invalid("connectTimeout '{$value}' is not a duration like 500ms or 5s"));
+            }
+            $this->connectTimeout = $c;
+            return .ok;
+        }
+        if ($key == 'multiStatements') {
+            bool $m = guard flag($value) else {
+                return .error(.invalid("multiStatements is true or false, not '{$value}'"));
+            }
+            $this->multiStatements = $m;
+            return .ok;
+        }
+        if ($key == 'fetchServerKey') {
+            bool $f = guard flag($value) else {
+                return .error(.invalid("fetchServerKey is true or false, not '{$value}'"));
+            }
+            $this->fetchServerKey = $f;
+            return .ok;
+        }
+        if ($key == 'statementCache' || $key == 'maxPacket' || $key == 'collation') {
+            uint64 $n = guard str::uint($value) else {
+                return .error(.invalid("{$key} is a number, not '{$value}'"));
+            }
+            if ($key == 'statementCache') {
+                $this->statementCache = $n as usize;
+            } else if ($key == 'maxPacket') {
+                if ($n == 0) {
+                    return .error(.invalid('maxPacket 0 lets no packet through'));
+                }
+                $this->maxPacket = $n as usize;
+            } else {
+                if ($n > 255) {
+                    return .error(.invalid("collation {$n} is over 255"));
+                }
+                $this->collation = $n as uint8;
+            }
+            return .ok;
+        }
+        return .error(.invalid("unknown option '{$key}'"));
+    }
+}
+
+/**
+ * `%XX` escapes decoded, or null when one is broken.
+ */
+internal function unescape(const string& $s) : string?
+{
+    string $out = '';
+    usize $i = 0;
+    while ($i < $s->size()) {
+        uint8 $c = $s->byte($i);
+        if ($c != 37) {
+            $out->push($c);
+            $i = $i + 1;
+            continue;
+        }
+        if ($i + 2 >= $s->size()) {
+            return null;
+        }
+        uint8 $hi = guard hexDigit($s->byte($i + 1)) else {
+            return null;
+        }
+        uint8 $lo = guard hexDigit($s->byte($i + 2)) else {
+            return null;
+        }
+        $out->push(($hi << 4) | $lo);
+        $i = $i + 3;
+    }
+    string? $done = $out;
+    return $done;
+}
+
+internal function hexDigit(uint8 $c) : uint8?
+{
+    if ($c >= 48 && $c <= 57) {
+        uint8? $d = $c - 48;
+        return $d;
+    }
+    if ($c >= 97 && $c <= 102) {
+        uint8? $l = $c - 87;
+        return $l;
+    }
+    if ($c >= 65 && $c <= 70) {
+        uint8? $u = $c - 55;
+        return $u;
+    }
+    return null;
+}
+
+internal function port(const string& $text) : result<uint16, Error>
+{
+    uint64 $n = guard str::uint($text) else {
+        return .error(.invalid("port '{$text}' is not a number"));
+    }
+    if ($n == 0 || $n > 65535) {
+        return .error(.invalid("port {$n} is not 1..65535"));
+    }
+    return .ok($n as uint16);
+}
+
+/**
+ * `250ms`, `5s` or `2m`, or a bare number of seconds.
+ */
+internal function duration(const string& $text) : time::duration?
+{
+    string $digits = $text;
+    int64 $scale = 1000;
+    if ($text->ends('ms')) {
+        $digits = $text->sub(0, $text->size() - 2);
+        $scale = 1;
+    } else if ($text->ends('s')) {
+        $digits = $text->sub(0, $text->size() - 1);
+    } else if ($text->ends('m')) {
+        $digits = $text->sub(0, $text->size() - 1);
+        $scale = 60000;
+    }
+    int64 $n = guard str::int($digits) else {
+        return null;
+    }
+    // too long to count in milliseconds: refused rather than wrapped round
+    if ($n < 0 || $n > 9223372036854775807 / $scale) {
+        return null;
+    }
+    time::duration? $d = time::duration::millis($n * $scale);
+    return $d;
+}
+
+internal function flag(const string& $text) : bool?
+{
+    if ($text == 'true' || $text == '1') {
+        return true;
+    }
+    if ($text == 'false' || $text == '0') {
+        return false;
+    }
+    return null;
+}

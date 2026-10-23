@@ -1,0 +1,133 @@
+/**
+ * A tour of libmysql against a server you name: `MYSQL_URL=mysql://user:pass@host/db echoc run`.
+ * Makes a table, writes to it three ways, reads it back three ways, and cleans up.
+ */
+
+use std::time;
+
+string $url = 'mysql://root@127.0.0.1/test';
+string::view? $env = std::env::var('MYSQL_URL');
+if ($env != null) {
+    string::view $v = guard $env;
+    $url = string::from($v);
+}
+
+mysql::Options $options = guard mysql::Options::parse($url) else ($e) {
+    die("MYSQL_URL: {$e}");
+}
+$options->fetchServerKey = true;
+$options->timeout = time::duration::secs(10);
+
+mysql::Connection $db = guard mysql::Connection::open($options) else ($e) {
+    die("connect: {$e}");
+}
+echo "connected to MySQL {$db->server} as connection {$db->id}";
+
+guard $db->exec('DROP TABLE IF EXISTS products');
+guard $db->exec('CREATE TABLE products (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    note VARCHAR(200) NULL,
+    price DECIMAL(10,2) NOT NULL,
+    stock INT NOT NULL,
+    added DATETIME DEFAULT CURRENT_TIMESTAMP
+)');
+
+// named placeholders: a map literal, the server hands back the new id
+mysql::Outcome $lamp = guard $db->exec('INSERT INTO products (name, price, stock) VALUES (:name, :price, :stock)', [
+    'name'  => 'Lamp',
+    'price' => .decimal('49.90'),
+    'stock' => 12,
+]) else ($e) {
+    die("insert: {$e}");
+}
+echo "inserted lamp as #{$lamp->lastInsertId}";
+
+// one value, one ?
+guard $db->exec('INSERT INTO products (name, price, stock) VALUES (?, 129.00, 4)', ['Chair']) else ($e) {
+    die("insert: {$e}");
+}
+
+// a multi-row insert: your SQL, one row of values per loop
+array<string> $names = ['Desk', 'Shelf', 'Rug'];
+string $sql = 'INSERT INTO products (name, price, stock) VALUES ';
+mysql::Params $values = [];
+foreach ($names as $i => $name) {
+    if ($i > 0) {
+        $sql->append(', ');
+    }
+    $sql->append('(?, ?, ?)');
+    $values->add([$name, .decimal('10.00'), $i as int32]);
+}
+mysql::Outcome $many = guard $db->exec($sql, $values) else ($e) {
+    die("insert: {$e}");
+}
+echo "inserted {$many->affectedRows} more";
+
+// a duplicate is an error you can name
+result<mysql::Outcome, mysql::Error> $again = $db->exec('INSERT INTO products (name, price, stock) VALUES (?, 1, 1)', ['Lamp']);
+if ($again->failed() && $again->failure()->is(.dupEntry)) {
+    echo 'Lamp is already there';
+}
+
+// read: rows by column name, a range built as a chain
+mysql::ResultSet $cheap = guard $db->query('SELECT name, price, stock FROM products WHERE price BETWEEN :min AND :max ORDER BY name',
+    .named(['min' => 0])->set('max', 100));
+foreach ($cheap as $row) {
+    int64 $stock = $row['stock']->int() ?? 0;
+    echo "{$row['name']}: {$row['price']} ({$stock} in stock)";
+}
+
+guard $db->exec('UPDATE products SET stock = stock - 1 WHERE name = ?', ['Lamp']) else ($e) {
+    die("update: {$e}");
+}
+
+// a value that may be null goes in as SQL NULL
+string? $note = null;
+guard $db->exec('UPDATE products SET note = :note WHERE name = :name', ['note' => $note, 'name' => 'Rug']) else ($e) {
+    die("update: {$e}");
+}
+
+// a transaction: commit on .ok, roll back on .error
+guard $db->transaction(function(mysql::Connection $tx) : status<mysql::Error> {
+    guard $tx->exec('UPDATE products SET stock = stock - 1 WHERE name = ?', ['Chair']) else ($e) {
+        return .error($e);
+    }
+    guard $tx->exec('UPDATE products SET note = ? WHERE name = ?', ['last one soon', 'Chair']) else ($e) {
+        return .error($e);
+    }
+    return .ok;
+}) else ($e) {
+    die("transaction: {$e}");
+}
+
+// stream: one row at a time
+mysql::Rows $stream = guard $db->stream('SELECT id, name, note FROM products ORDER BY id');
+foreach ($stream as $row) {
+    string $note = $row['note']->text() ?? '-';
+    echo "#{$row['id']} {$row['name']} {$note}";
+}
+guard $stream->finish();
+
+// stream, in place: find the columns once, then read each row by position
+mysql::Rows $raw = guard $db->stream('SELECT name, stock FROM products ORDER BY id');
+usize $stockAt = $raw->columns()->find('stock') ?? 0;
+int64 $units = 0;
+while (true) {
+    bool $more = guard $raw->step();
+    if (!$more) {
+        break;
+    }
+    $units = $units + ($raw->view()->int($stockAt) ?? 0);
+}
+echo "{$units} units in stock";
+
+// a pool, shared by whoever needs it
+mysql::Pool $pool = mysql::Pool($options, mysql::PoolOptions($max: 4));
+mysql::ResultSet $count = guard $pool->query('SELECT COUNT(*) AS n FROM products');
+echo "the pool counts {$count[0]['n']} products";
+$pool->close();
+
+guard $db->exec('DROP TABLE products');
+$db->close();
+echo 'done';

@@ -1,0 +1,208 @@
+use mysql::{Value, Date, DateTime, Time};
+
+internal function asValue(Value $v) : Value
+{
+    return $v;
+}
+
+test plain_values_convert_implicitly
+{
+    assert((asValue(7)->int() ?? 0) == 7);
+    assert((asValue('Ada')->text() ?? '') == 'Ada');
+    assert(asValue(true)->bool() ?? false);
+    assert((asValue(1.5)->float() ?? 0.0) == 1.5);
+    string? $nick = null;
+    assert(asValue($nick)->isNull());
+    int64 $raw = 42;
+    int64? $some = $raw;
+    assert((asValue($some)->int() ?? 0) == 42);
+}
+
+test typed_reads_are_strict
+{
+    Value $t = .text('12');
+    assert($t->int() == null);
+    Value $neg = .int(-1);
+    assert($neg->uint() == null);
+    Value $big = .uint(18446744073709551615);
+    assert($big->int() == null);
+    assert(($big->uint() ?? 0) == 18446744073709551615);
+    Value $d = .decimal('12.50');
+    assert(($d->text() ?? '') == '12.50');
+    assert(($d->float() ?? 0.0) == 12.5);
+    Value $b = .bytes('raw');
+    assert(($b->text() ?? '') == 'raw');
+}
+
+test dates_parse_and_print
+{
+    Date $d = guard Date::parse('2024-02-29');
+    assert($d->year == 2024 && $d->month == 2 && $d->day == 29);
+    assert("{$d}" == '2024-02-29');
+    assert(Date::parse('2024-2-29') == null);
+
+    DateTime $dt = guard DateTime::parse('2024-02-29 13:05:09.012300');
+    assert($dt->hour == 13 && $dt->minute == 5 && $dt->second == 9 && $dt->micro == 12300);
+    assert("{$dt}" == '2024-02-29 13:05:09.012300');
+    DateTime $plain = guard DateTime::parse('0000-00-00 00:00:00');
+    assert("{$plain}" == '0000-00-00 00:00:00');
+
+    Time $t = guard Time::parse('-838:59:59.5');
+    assert($t->negative && $t->hours == 838 && $t->micro == 500000);
+    assert("{$t}" == '-838:59:59.500000');
+    assert(Time::parse('10:61:00') == null);
+}
+
+test values_print_like_mysql
+{
+    Value $n = .none;
+    assert("{$n}" == 'NULL');
+    Value $i = .int(-3);
+    assert("{$i}" == '-3');
+    Value $d = asValue(Date(2001, 9, 9));
+    assert("{$d}" == '2001-09-09');
+    assert($d->datetime() != null);
+}
+
+test every_implicit_conversion_picks_its_case
+{
+    int32 $i32 = -4;
+    uint32 $u32 = 4;
+    uint64 $u64 = 18446744073709551615;
+    assert(asValue($i32)->kind() == 'int');
+    assert(asValue($u32)->kind() == 'uint');
+    assert(asValue($u64)->kind() == 'uint');
+    assert(asValue(false)->kind() == 'int' && !(asValue(false)->bool() ?? true));
+    assert(asValue(Date(2024, 1, 2))->kind() == 'date');
+    assert(asValue(DateTime(2024, 1, 2, 3, 4, 5))->kind() == 'datetime');
+    assert(asValue(Time(false, 1, 2, 3, 0))->kind() == 'time');
+
+    // a nullable is the value, or NULL
+    int32? $noI32 = null;
+    int64? $noI64 = null;
+    uint64? $noU64 = null;
+    float64? $noF = null;
+    bool? $noB = null;
+    Date? $noD = null;
+    DateTime? $noDt = null;
+    Time? $noT = null;
+    assert(asValue($noI32)->isNull() && asValue($noI64)->isNull() && asValue($noU64)->isNull());
+    assert(asValue($noF)->isNull() && asValue($noB)->isNull());
+    assert(asValue($noD)->isNull() && asValue($noDt)->isNull() && asValue($noT)->isNull());
+
+    int32? $someI32 = $i32;
+    uint64? $someU64 = $u64;
+    float64? $someF = 2.5;
+    bool? $someB = true;
+    string? $someS = 'x';
+    Date? $someD = Date(2024, 1, 2);
+    DateTime? $someDt = DateTime(2024, 1, 2);
+    Time? $someT = Time(true, 30, 0, 0, 0);
+    assert((asValue($someI32)->int() ?? 0) == -4);
+    assert((asValue($someU64)->uint() ?? 0) == $u64);
+    assert((asValue($someF)->float() ?? 0.0) == 2.5);
+    assert(asValue($someB)->bool() ?? false);
+    assert((asValue($someS)->text() ?? '') == 'x');
+    assert(asValue($someD)->kind() == 'date');
+    assert(asValue($someDt)->kind() == 'datetime');
+    assert(asValue($someT)->kind() == 'time');
+}
+
+test every_kind_has_its_name
+{
+    array<Value> $all = [.none, .int(1), .uint(1), .float(1.0), .decimal('1'), .text('1'), .bytes('1'), .date(Date()), .datetime(DateTime()), .time(Time())];
+    array<string> $names = ['null', 'int', 'uint', 'float', 'decimal', 'text', 'bytes', 'date', 'datetime', 'time'];
+    foreach ($all as $i => const &$v) {
+        assert($v->kind() == $names[$i]);
+        assert($v->isNull() == ($i == 0));
+    }
+}
+
+test numeric_reads_cross_over_where_they_fit
+{
+    Value $u = .uint(5);
+    assert(($u->int() ?? 0) == 5);
+    assert(($u->float() ?? 0.0) == 5.0);
+    assert($u->bool() ?? false);
+    Value $zero = .uint(0);
+    assert(!($zero->bool() ?? true));
+    Value $i = .int(-2);
+    assert(($i->float() ?? 0.0) == -2.0);
+    Value $pos = .int(9);
+    assert(($pos->uint() ?? 0) == 9);
+    Value $f = .float(1.0);
+    assert($f->int() == null && $f->bool() == null && $f->text() == null);
+    Value $bad = .decimal('not a number');
+    assert($bad->float() == null);
+    // a decimal is text, never bytes
+    Value $d = .decimal('1.5');
+    assert($d->bytes() == null);
+    Value $t = .text('abc');
+    assert(($t->bytes() ?? '') == 'abc');
+    assert($t->float() == null && $t->date() == null && $t->time() == null && $t->datetime() == null);
+    Value $none = .none;
+    assert($none->int() == null && $none->text() == null && $none->bool() == null);
+}
+
+test temporal_reads_are_strict_except_date_to_datetime
+{
+    Value $dt = .datetime(DateTime(2024, 5, 6, 7, 8, 9, 10));
+    assert($dt->date() == null);
+    assert($dt->time() == null);
+    DateTime $back = guard $dt->datetime();
+    assert($back->micro == 10);
+    Value $t = .time(Time(false, 100, 0, 0, 0));
+    assert($t->datetime() == null);
+    Time $tt = guard $t->time();
+    assert($tt->hours == 100);
+    Value $d = .date(Date(2024, 5, 6));
+    DateTime $midnight = guard $d->datetime();
+    assert($midnight->year == 2024 && $midnight->hour == 0 && $midnight->micro == 0);
+}
+
+test date_and_time_text_that_is_not_one
+{
+    assert(Date::parse('2024/01/01') == null);
+    assert(Date::parse('2024-01-0x') == null);
+    assert(Date::parse('') == null);
+    assert(DateTime::parse('2024-01-01T10:00:00') == null);
+    assert(DateTime::parse('2024-01-01 10:00') == null);
+    assert(DateTime::parse('2024-01-01 24:00:00') == null);
+    assert(DateTime::parse('2024-01-01 -1:00:00') == null);
+    assert(DateTime::parse('2024-01-01 10:00:00.') == null);
+    assert(DateTime::parse('2024-01-01 10:00:00.1234567') == null);
+    assert(Time::parse('') == null);
+    assert(Time::parse(':10:00') == null);
+    assert(Time::parse('10:00') == null);
+    assert(Time::parse('10-00-00') == null);
+    assert(Time::parse('10:00:61') == null);
+    assert(Time::parse('10:00:00,5') == null);
+    assert(Time::parse('1234567890:00:00') == null);
+
+    // a bare date is a datetime at midnight, and fractions pad to microseconds
+    DateTime $bare = guard DateTime::parse('2024-03-04');
+    assert($bare->day == 4 && $bare->hour == 0);
+    DateTime $f1 = guard DateTime::parse('2024-03-04 05:06:07.1');
+    assert($f1->micro == 100000);
+    Time $long = guard Time::parse('100:00:00.000001');
+    assert($long->hours == 100 && $long->micro == 1 && !$long->negative);
+}
+
+test temporal_values_print_padded
+{
+    assert(str::from(Time(false, 5, 6, 7, 0)) == '05:06:07');
+    assert(str::from(Time(true, 0, 0, 1, 42)) == '-00:00:01.000042');
+    assert(str::from(DateTime(7, 1, 2, 3, 4, 5, 0)) == '0007-01-02 03:04:05');
+    Value $f = .float(0.5);
+    assert("{$f}" == '0.5');
+    Value $u = .uint(18446744073709551615);
+    assert("{$u}" == '18446744073709551615');
+    Value $dec = .decimal('-0.10');
+    assert("{$dec}" == '-0.10');
+    Value $b = .bytes('ab');
+    assert("{$b}" == 'ab');
+    Value $tm = .time(Time(false, 838, 59, 59, 0));
+    assert("{$tm}" == '838:59:59');
+    Value $dt = .datetime(DateTime(2024, 12, 31, 23, 59, 59, 999999));
+    assert("{$dt}" == '2024-12-31 23:59:59.999999');
+}

@@ -1,0 +1,246 @@
+/**
+ * Whole conversations against the scripted server in fake.eco: what the client sends is checked
+ * byte for byte, and the paths a real server rarely takes (an auth switch, a plugin we refuse, a
+ * file request, a packet out of order) are taken on purpose.
+ */
+
+use mysql::auth::{native, cachingSha2};
+
+test session_native_login_and_a_text_query
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('mysql_native_password');
+        assert($a->user == 'app');
+        assert($a->database == 'shop');
+        assert($a->plugin == 'mysql_native_password');
+        assert($a->auth == native('secret', scramble()));
+        assert(($a->caps & mysql::protocol::CLIENT_LOCAL_FILES) == 0);
+        assert(($a->caps & mysql::protocol::CLIENT_MULTI_STATEMENTS) == 0);
+        $w->send(okPacket());
+
+        assert($w->expect(mysql::protocol::COM_QUERY) == 'SELECT id, name, note');
+        $w->send(countPacket(3));
+        $w->send(columnDef('id', 8, mysql::protocol::FLAG_UNSIGNED));
+        $w->send(columnDef('name', 253));
+        $w->send(columnDef('note', 253));
+        $w->send(textRowOf(['1', 'Ada', '<NULL>']));
+        $w->send(textRowOf(['2', 'Grace', 'hi']));
+        $w->send(okEnd());
+
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUIT);
+    });
+    mysql::Connection $db = login($f);
+    assert($db->server == '8.0.99-fake');
+    assert($db->id == 77);
+    mysql::ResultSet $rs = guard $db->query('SELECT id, name, note') else ($e) {
+        die("{$e}");
+    }
+    assert($rs->count() == 2);
+    assert(($rs[0]['id']->uint() ?? 0) == 1);
+    assert($rs[0]['note']->isNull());
+    assert(($rs[1]['name']->text() ?? '') == 'Grace');
+    $db->close();
+}
+
+test session_auth_switch_to_native
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('caching_sha2_password');
+        assert($a->auth == cachingSha2('secret', scramble()));
+        // switch, with a fresh scramble
+        string $fresh = str::repeat('z', 20);
+        $w->send(switchTo('mysql_native_password', "{$fresh}\0"));
+        assert($w->recv() == native('secret', $fresh));
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    assert($db->plugin == mysql::Plugin::native);
+}
+
+#[if: os != windows]
+test session_caching_sha2_full_auth_over_a_unix_socket_sends_the_password
+{
+    // /tmp, not the temp dir: macOS's is too long for a socket path
+    int32 $pid = std::env::pid();
+    string $path = "/tmp/libmysql-{$pid}.sock";
+    Fake $f = fakeUnix($path, function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        $w->send(fullAuth());
+        string $plain = $w->recv();
+        assert($plain == "secret\0");
+        $w->send(okPacket());
+    });
+    mysql::Options $o = mysql::Options($user: 'app', $password: 'secret', $socket: $path);
+    mysql::Connection $db = login($o);
+    assert($db->alive());
+}
+#[end]
+
+test session_caching_sha2_full_auth_over_tcp_needs_the_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        $w->send(fullAuth());
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed());
+    match ($r->failure()) {
+        mysql::Error::auth($a) => {
+            assert($a->message()->contains('serverKey'));
+        },
+        else => {
+            die("expected an auth error, got {$r->failure()}");
+        },
+    }
+}
+
+test session_cached_fast_auth
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        string $three = '';
+        $three->push(3);
+        $w->send(more($three));
+        $w->send(okPacket());
+    });
+    assert(login($f)->plugin == mysql::Plugin::cachingSha2);
+}
+
+test session_an_early_refusal_is_the_server_error
+{
+    Fake $f = fake(function(Wire $w) : void {
+        string $p = '';
+        $p->push(255);
+        tcp::wire::putLe16($p, 1040);
+        $p->append('Too many connections');
+        $w->send($p);
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed());
+    assert($r->failure()->is(.tooManyConnections));
+}
+
+test session_cleartext_is_refused_over_tcp
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        $w->send(switchTo('mysql_clear_password'));
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed() && $r->failure()->name() == 'auth');
+}
+
+test session_a_local_file_request_is_refused
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+
+        $w->recv();
+        $w->send(fileRequest('/etc/passwd'));
+        // the client sends no file: an empty packet
+        assert($w->recv()->empty());
+        $w->send(errPacket(2027, 'HY000', 'Malformed packet'));
+
+        // and the connection still works
+        $w->recv();
+        $w->send(okPacket(3));
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Outcome, mysql::Error> $r = $db->exec('LOAD DATA LOCAL INFILE \'/etc/passwd\' INTO TABLE t');
+    assert($r->failed() && $r->failure()->name() == 'localInfile');
+    mysql::Outcome $o = guard $db->exec('DELETE FROM t') else ($e) {
+        die("{$e}");
+    }
+    assert($o->affectedRows == 3);
+}
+
+test session_a_packet_out_of_order_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->recv();
+        $w->sendAs(7, okPacket());
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Outcome, mysql::Error> $r = $db->exec('DO 1');
+    assert($r->failed() && $r->failure()->name() == 'malformed');
+    assert(!$db->alive());
+}
+
+test session_old_style_eof_result_sets
+{
+    // a server without DEPRECATE_EOF: EOF after the columns and at the end of the rows
+    uint32 $caps = SERVER_CAPS & ~mysql::protocol::CLIENT_DEPRECATE_EOF;
+    Fake $f = fake(function(Wire $w) : void {
+        $w->send(hello('mysql_native_password', $caps));
+        Answer $a = answer($w->recv());
+        assert(($a->caps & mysql::protocol::CLIENT_DEPRECATE_EOF) == 0);
+        $w->send(okPacket());
+        $w->recv();
+        $w->send(countPacket(1));
+        $w->send(columnDef('n', 3));
+        $w->send(eofPacket());
+        $w->send(textRowOf(['-5']));
+        $w->send(eofPacket());
+    });
+    mysql::Connection $db = login($f);
+    mysql::ResultSet $rs = guard $db->query('SELECT n') else ($e) {
+        die("{$e}");
+    }
+    assert(($rs[0]['n']->int() ?? 0) == -5);
+}
+
+test session_server_errors_keep_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->recv();
+        $w->send(errPacket(1062, '23000', 'Duplicate entry \'1\' for key \'PRIMARY\''));
+        $w->recv();
+        $w->send(okPacket(1, 42));
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Outcome, mysql::Error> $dup = $db->exec('INSERT 1');
+    assert($dup->failed());
+    mysql::Error $e = $dup->failure();
+    assert($e->is(.dupEntry));
+    assert("{$e}" == '1062 (23000): Duplicate entry \'1\' for key \'PRIMARY\'');
+    mysql::Outcome $ok = guard $db->exec('INSERT 2') else ($err) {
+        die("{$err}");
+    }
+    assert($ok->lastInsertId == 42);
+}
+
+test session_prepared_execute_encodes_parameters
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+
+        assert($w->expect(mysql::protocol::COM_STMT_PREPARE) == 'UPDATE t SET a = ?, b = ? WHERE c = ?');
+        $w->send(prepareOk(9, 0, 3));
+        $w->send(columnDef('?', 253));
+        $w->send(columnDef('?', 253));
+        $w->send(columnDef('?', 253));
+
+        string $exec = $w->recv();
+        assert($exec->byte(0) == mysql::protocol::COM_STMT_EXECUTE);
+        assert(tcp::wire::le32($exec, 1) == 9);
+        // flags, iteration count, the NULL bitmap (third value), new-params-bound
+        assert($exec->byte(5) == 0);
+        assert(tcp::wire::le32($exec, 6) == 1);
+        assert($exec->byte(10) == 4);
+        assert($exec->byte(11) == 1);
+        // types: LONGLONG, STRING, NULL
+        assert($exec->byte(12) == 8 && $exec->byte(14) == 254 && $exec->byte(16) == 6);
+        assert(tcp::wire::le64($exec, 18) == 7);
+        assert($exec->byte(26) == 3 && $exec->sub(27, 3) == 'Ada');
+        $w->send(okPacket(1));
+    });
+    mysql::Connection $db = login($f);
+    string? $none = null;
+    mysql::Outcome $o = guard $db->exec('UPDATE t SET a = :a, b = :b WHERE c = :c',
+        ['b' => 'Ada', 'a' => 7, 'c' => $none]) else ($e) {
+        die("{$e}");
+    }
+    assert($o->affectedRows == 1);
+}

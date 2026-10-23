@@ -1,0 +1,7 @@
+test links_against_libtcp_and_libcrypto
+{
+    assert(crypto::hex(crypto::sha1('')) == 'da39a3ee5e6b4b0d3255bfef95601890afd80709');
+    tcp::Deadline $d = tcp::Deadline(ms: 10);
+    assert(!$d->passed());
+    assert(mysql::VERSION == '0.1.0');
+}

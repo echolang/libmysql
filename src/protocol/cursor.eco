@@ -1,0 +1,219 @@
+/**
+ * A read position in one packet payload. Every read checks the bytes are there and answers
+ * `.malformed` when they are not. A server's packet is input, so a short one is an error the
+ * caller hears about, never a read past the end.
+ */
+
+namespace mysql::protocol;
+
+internal struct Cursor
+{
+    internal string $data;
+    internal usize $at = 0;
+
+    internal const function left() : usize
+    {
+        return $this->data->size() - $this->at;
+    }
+
+    internal const function done() : bool
+    {
+        return $this->at >= $this->data->size();
+    }
+
+    /**
+     * The next byte without consuming it. There has to be one.
+     */
+    internal const function peek() : uint8
+    {
+        return $this->data->byte($this->at);
+    }
+
+    internal function skip(usize $n) : status<mysql::Error>
+    {
+        guard $this->need($n, 'skip') else ($e) {
+            return .error($e);
+        }
+        $this->at = $this->at + $n;
+        return .ok;
+    }
+
+    internal function u8() : result<uint8, mysql::Error>
+    {
+        guard $this->need(1, 'u8') else ($e) {
+            return .error($e);
+        }
+        uint8 $v = $this->data->byte($this->at);
+        $this->at = $this->at + 1;
+        return .ok($v);
+    }
+
+    internal function u16() : result<uint16, mysql::Error>
+    {
+        guard $this->need(2, 'u16') else ($e) {
+            return .error($e);
+        }
+        uint16 $v = tcp::wire::le16($this->data, $this->at);
+        $this->at = $this->at + 2;
+        return .ok($v);
+    }
+
+    internal function u24() : result<uint32, mysql::Error>
+    {
+        guard $this->need(3, 'u24') else ($e) {
+            return .error($e);
+        }
+        uint32 $v = tcp::wire::le24($this->data, $this->at);
+        $this->at = $this->at + 3;
+        return .ok($v);
+    }
+
+    internal function u32() : result<uint32, mysql::Error>
+    {
+        guard $this->need(4, 'u32') else ($e) {
+            return .error($e);
+        }
+        uint32 $v = tcp::wire::le32($this->data, $this->at);
+        $this->at = $this->at + 4;
+        return .ok($v);
+    }
+
+    internal function u64() : result<uint64, mysql::Error>
+    {
+        guard $this->need(8, 'u64') else ($e) {
+            return .error($e);
+        }
+        uint64 $v = tcp::wire::le64($this->data, $this->at);
+        $this->at = $this->at + 8;
+        return .ok($v);
+    }
+
+    /**
+     * A length-encoded integer. `0xFB` is NULL in a text row, and answers null here.
+     */
+    internal function lenenc() : result<uint64?, mysql::Error>
+    {
+        uint8 $first = guard $this->u8() else ($e) {
+            return .error($e);
+        }
+        uint64? $v = null;
+        if ($first < 251) {
+            $v = $first as uint64;
+            return .ok($v);
+        }
+        if ($first == 251) {
+            return .ok($v);
+        }
+        if ($first == 252) {
+            uint16 $n16 = guard $this->u16() else ($e) {
+                return .error($e);
+            }
+            $v = $n16 as uint64;
+            return .ok($v);
+        }
+        if ($first == 253) {
+            uint32 $n24 = guard $this->u24() else ($e) {
+                return .error($e);
+            }
+            $v = $n24 as uint64;
+            return .ok($v);
+        }
+        if ($first == 254) {
+            uint64 $n64 = guard $this->u64() else ($e) {
+                return .error($e);
+            }
+            $v = $n64;
+            return .ok($v);
+        }
+        return .error(.malformed('0xFF is not a length-encoded integer'));
+    }
+
+    /**
+     * A length-encoded integer that may not be NULL.
+     */
+    internal function count() : result<uint64, mysql::Error>
+    {
+        uint64? $v = guard $this->lenenc() else ($e) {
+            return .error($e);
+        }
+        uint64 $n = guard $v else {
+            return .error(.malformed('a NULL where a length was expected'));
+        }
+        return .ok($n);
+    }
+
+    internal function bytes(usize $n) : result<string, mysql::Error>
+    {
+        guard $this->need($n, 'string') else ($e) {
+            return .error($e);
+        }
+        string $s = $this->data->sub($this->at, $n);
+        $this->at = $this->at + $n;
+        return .ok($s);
+    }
+
+    /**
+     * A length-encoded string, or null for a NULL in a text row.
+     */
+    internal function text() : result<string?, mysql::Error>
+    {
+        uint64? $len = guard $this->lenenc() else ($e) {
+            return .error($e);
+        }
+        uint64 $n = guard $len else {
+            string? $none = null;
+            return .ok($none);
+        }
+        if ($n > $this->left() as uint64) {
+            return .error(.malformed("a string of {$n} bytes with {$this->left()} left"));
+        }
+        string? $s = guard $this->bytes($n as usize) else ($e) {
+            return .error($e);
+        }
+        return .ok($s);
+    }
+
+    /**
+     * A length-encoded string that may not be NULL.
+     */
+    internal function string() : result<string, mysql::Error>
+    {
+        string? $s = guard $this->text() else ($e) {
+            return .error($e);
+        }
+        string $v = guard $s else {
+            return .error(.malformed('a NULL where a string was expected'));
+        }
+        return .ok($v);
+    }
+
+    /**
+     * The bytes up to the next NUL, consumed with it. A payload that ends first answers the rest:
+     * some servers leave the last NUL off.
+     */
+    internal function nul() : string
+    {
+        usize $end = $this->data->find("\0", $this->at);
+        string $s = $this->data->sub($this->at, $end - $this->at);
+        $this->at = $end;
+        if ($this->at < $this->data->size()) {
+            $this->at = $this->at + 1;
+        }
+        return $s;
+    }
+
+    internal function rest() : string
+    {
+        string $s = $this->data->sub($this->at, $this->left());
+        $this->at = $this->data->size();
+        return $s;
+    }
+
+    private const function need(usize $n, const string& $what) : status<mysql::Error>
+    {
+        if ($this->left() < $n) {
+            return .error(.malformed("{$what}: {$n} bytes wanted, {$this->left()} left"));
+        }
+        return .ok;
+    }
+}

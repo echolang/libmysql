@@ -1,0 +1,909 @@
+/**
+ * Rows on the wire, decoded into `Value`s by what the column says it is. Text protocol: every
+ * value a length-encoded string, `0xFB` for NULL. Binary protocol of prepared statements: a NULL
+ * bitmap, then each value in its own fixed or length-prefixed shape. The other direction too:
+ * parameters into COM_STMT_EXECUTE.
+ */
+
+namespace mysql::protocol;
+
+use mysql::{Value, Column, ColumnType, Columns, Date, DateTime, Time};
+
+// MYSQL_TYPE_* numbers a parameter is sent as
+internal const uint8 TYPE_DOUBLE = 5;
+internal const uint8 TYPE_NULL = 6;
+internal const uint8 TYPE_LONGLONG = 8;
+internal const uint8 TYPE_DATE = 10;
+internal const uint8 TYPE_TIME = 11;
+internal const uint8 TYPE_DATETIME = 12;
+internal const uint8 TYPE_NEWDECIMAL = 246;
+internal const uint8 TYPE_BLOB = 252;
+internal const uint8 TYPE_STRING = 254;
+
+/**
+ * How a column's value is decoded, decided once per column from its type, flags and charset.
+ */
+internal enum Shape
+{
+    case signed;
+    case unsigned;
+    case real;
+    case decimal;
+    case date;
+    case datetime;
+    case time;
+    case text;
+    case bytes;
+}
+
+internal function shape(const Column& $c) : Shape
+{
+    ColumnType $t = $c->type;
+    if ($t == ColumnType::tiny || $t == ColumnType::short || $t == ColumnType::long || $t == ColumnType::int24 || $t == ColumnType::longlong || $t == ColumnType::year) {
+        if ($c->unsigned()) {
+            return .unsigned;
+        }
+        return .signed;
+    }
+    if ($t == ColumnType::float || $t == ColumnType::double) {
+        return .real;
+    }
+    if ($t == ColumnType::decimal || $t == ColumnType::newdecimal) {
+        return .decimal;
+    }
+    if ($t == ColumnType::date || $t == ColumnType::newdate) {
+        return .date;
+    }
+    if ($t == ColumnType::datetime || $t == ColumnType::timestamp || $t == ColumnType::datetime2 || $t == ColumnType::timestamp2) {
+        return .datetime;
+    }
+    if ($t == ColumnType::time || $t == ColumnType::time2) {
+        return .time;
+    }
+    if ($t == ColumnType::bit || $t == ColumnType::geometry || $t == ColumnType::vector) {
+        return .bytes;
+    }
+    // JSON comes in the binary charset, and is text all the same
+    if ($t == ColumnType::json) {
+        return .text;
+    }
+    if ($c->binary()) {
+        return .bytes;
+    }
+    return .text;
+}
+
+/**
+ * One text-protocol value: the string the server sent, read as `$s`, the column's shape.
+ */
+internal function textValue(const Column& $c, Shape $s, const string& $raw) : result<Value, mysql::Error>
+{
+    match ($s) {
+        Shape::signed => {
+            int64 $n = guard str::int($raw) else {
+                return .error(.malformed("'{$raw}' in column '{$c->name}' is not an integer"));
+            }
+            return .ok(.int($n));
+        },
+        Shape::unsigned => {
+            uint64 $u = guard str::uint($raw) else {
+                return .error(.malformed("'{$raw}' in column '{$c->name}' is not an integer"));
+            }
+            return .ok(.uint($u));
+        },
+        Shape::real => {
+            float64 $f = guard str::float($raw) else {
+                return .error(.malformed("'{$raw}' in column '{$c->name}' is not a number"));
+            }
+            return .ok(.float($f));
+        },
+        Shape::decimal => {
+            return .ok(.decimal($raw));
+        },
+        Shape::date => {
+            Date $d = guard Date::parse($raw) else {
+                return .error(.malformed("'{$raw}' in column '{$c->name}' is not a date"));
+            }
+            return .ok(.date($d));
+        },
+        Shape::datetime => {
+            DateTime $dt = guard DateTime::parse($raw) else {
+                return .error(.malformed("'{$raw}' in column '{$c->name}' is not a datetime"));
+            }
+            return .ok(.datetime($dt));
+        },
+        Shape::time => {
+            Time $t = guard Time::parse($raw) else {
+                return .error(.malformed("'{$raw}' in column '{$c->name}' is not a time"));
+            }
+            return .ok(.time($t));
+        },
+        Shape::text => {
+            return .ok(.text($raw));
+        },
+        Shape::bytes => {
+            return .ok(.bytes($raw));
+        },
+    }
+}
+
+// where `layout` marks a NULL value in `$starts`
+internal const uint32 NULL_AT = 4294967295;
+
+// a binary-protocol width that means "one length byte, then that many": DATE, DATETIME, TIME
+internal const uint8 LEN_BYTE = 255;
+
+/**
+ * How many bytes a binary-protocol value of column `$c` takes: its fixed width, `LEN_BYTE` for
+ * the temporal types, or 0 for a length-encoded string.
+ */
+internal function width(const Column& $c) : uint8
+{
+    ColumnType $t = $c->type;
+    if ($t == ColumnType::tiny) {
+        return 1;
+    }
+    if ($t == ColumnType::short || $t == ColumnType::year) {
+        return 2;
+    }
+    if ($t == ColumnType::long || $t == ColumnType::int24 || $t == ColumnType::float) {
+        return 4;
+    }
+    if ($t == ColumnType::longlong || $t == ColumnType::double) {
+        return 8;
+    }
+    Shape $s = shape($c);
+    if ($s == Shape::date || $s == Shape::datetime || $s == Shape::time) {
+        return LEN_BYTE;
+    }
+    return 0;
+}
+
+/**
+ * Where each value of a row starts, `NULL_AT` for a NULL. One pass, nothing decoded. `Walk`
+ * checks every value lies inside the payload, so the reads below skip their own offset checks.
+ * `$starts` is overwritten: a caller keeps one from row to row.
+ */
+internal function layout(string::view $p, const Columns& $columns, bool $binary, array<uint32>& $starts) : status<mysql::Error>
+{
+    usize $n = $columns->count();
+    if ($starts->count() != $n) {
+        $starts->clear();
+        $starts->reserve($n);
+        while ($starts->count() < $n) {
+            $starts->push(NULL_AT);
+        }
+    }
+    Walk $walk = Walk($p, $binary);
+    guard $walk->begin($n) else ($e) {
+        return .error($e);
+    }
+    usize $i = 0;
+    while ($i < $n) {
+        if (!$walk->step($i, $columns->widths[$i], $columns->shapes[$i])) {
+            return .error($walk->failure($i));
+        }
+        $starts[$i] = $walk->start;
+        $i = $i + 1;
+    }
+    return .ok;
+}
+
+/**
+ * The one walk over a row's values, which `layout` and `decodeRow` both take. `step` moves past
+ * one value and checks it against the payload on the way, same rules for both. A binary row
+ * starts with `0x00` and a NULL bitmap; a text row is length-encoded values, `0xFB` for NULL.
+ */
+internal struct Walk
+{
+    internal string::view $p;
+    internal bool $binary;
+    // where the next value starts
+    internal usize $at;
+    // where the value `step` just passed starts, length byte or prefix included; `NULL_AT` for a
+    // NULL
+    internal uint32 $start;
+    // the bytes of that value past its prefix, when it is a length-encoded string
+    internal Span $bytes;
+
+    internal constructor(string::view $p, bool $binary)
+    {
+        $this->p = $p;
+        $this->binary = $binary;
+        $this->at = 0;
+        $this->start = NULL_AT;
+        $this->bytes = Span(0, 0);
+    }
+
+    /**
+     * Past the header byte and the NULL bitmap of a binary row of `$n` values. Nothing to do for
+     * a text row.
+     */
+    internal function begin(usize $n) : status<mysql::Error>
+    {
+        if (!$this->binary) {
+            return .ok;
+        }
+        usize $end = 1 + ($n + 9) / 8;
+        if ($this->p->size < $end) {
+            return .error(.malformed('a binary row shorter than its NULL bitmap'));
+        }
+        $this->at = $end;
+        return .ok;
+    }
+
+    /**
+     * Past value `$i`, whose column has the binary width `$w` and the shape `$s`. False when it
+     * runs past the payload or has a length the protocol does not have; `failure` says which.
+     * Nothing moves on a false.
+     */
+    #[inline]
+    internal function step(usize $i, uint8 $w, Shape $s) : bool
+    {
+        usize $at = $this->at;
+        usize $size = $this->p->size;
+        if ($this->binary) {
+            // the bitmap starts two bits in
+            usize $bit = $i + 2;
+            if (($this->p->byte(1 + $bit / 8) & ((1 << (($bit % 8) as uint8)) as uint8)) != 0) {
+                $this->start = NULL_AT;
+                return true;
+            }
+            if ($w == LEN_BYTE) {
+                // a date, a datetime or a time: one length byte, then that many
+                if ($at >= $size) {
+                    return false;
+                }
+                usize $len = $this->p->byte($at) as usize;
+                if ($len > $size - $at - 1 || !temporal($s, $len)) {
+                    return false;
+                }
+                $this->start = $at as uint32;
+                $this->at = $at + 1 + $len;
+                return true;
+            }
+            if ($w != 0) {
+                if (($w as usize) > $size - $at) {
+                    return false;
+                }
+                $this->start = $at as uint32;
+                $this->at = $at + $w as usize;
+                return true;
+            }
+        } else {
+            if ($at >= $size) {
+                return false;
+            }
+            if ($this->p->byte($at) == 251) {
+                $this->start = NULL_AT;
+                $this->at = $at + 1;
+                return true;
+            }
+        }
+        // a length-encoded string: every value of a text row, and the strings of a binary one
+        Span $span = lenencChecked($this->p, $at);
+        if ($span->at == 0) {
+            return false;
+        }
+        $this->start = $at as uint32;
+        $this->bytes = $span;
+        $this->at = $span->at + $span->size;
+        return true;
+    }
+
+    /**
+     * Why `step` refused value `$i`.
+     */
+    internal const function failure(usize $i) : mysql::Error
+    {
+        if (!$this->binary && $this->at >= $this->p->size) {
+            return .malformed('a text row with fewer values than columns');
+        }
+        return .malformed("value {$i} of the row runs past its end or has a bad length");
+    }
+}
+
+/**
+ * Where a value's bytes are in a packet.
+ */
+internal struct Span
+{
+    internal usize $at;
+    internal usize $size;
+}
+
+/**
+ * Where the bytes of the length-encoded string at `$at` are, checked against the payload. A span
+ * at 0 when the length or the bytes it announces run past it. A real span never starts at 0.
+ */
+internal function lenencChecked(string::view $p, usize $at) : Span
+{
+    usize $size = $p->size;
+    if ($at >= $size) {
+        return Span(0, 0);
+    }
+    uint8 $first = $p->byte($at);
+    // most strings are under 251 bytes: a one-byte length
+    if ($first < 251) {
+        if (($first as usize) >= $size - $at) {
+            return Span(0, 0);
+        }
+        return Span($at + 1, $first as usize);
+    }
+    usize $head = 9;
+    if ($first == 252) {
+        $head = 3;
+    } else if ($first == 253) {
+        $head = 4;
+    } else if ($first != 254) {
+        return Span(0, 0);
+    }
+    if ($head > $size - $at) {
+        return Span(0, 0);
+    }
+    // only the bytes the length has were checked: read no more than those
+    uint64 $len = 0;
+    if ($head == 3) {
+        $len = tcp::wire::le16($p, $at + 1) as uint64;
+    } else if ($head == 4) {
+        $len = tcp::wire::le24($p, $at + 1) as uint64;
+    } else {
+        $len = tcp::wire::le64($p, $at + 1);
+    }
+    if ($len > ($size - $at - $head) as uint64) {
+        return Span(0, 0);
+    }
+    return Span($at + $head, $len as usize);
+}
+
+/**
+ * Where the bytes of the length-encoded string at `$at` are, which `layout` checked.
+ */
+internal function lenencSpan(string::view $p, usize $at) : Span
+{
+    uint8 $first = $p->byte($at);
+    if ($first < 251) {
+        return Span($at + 1, $first as usize);
+    }
+    if ($first == 252) {
+        return Span($at + 3, tcp::wire::le16($p, $at + 1) as usize);
+    }
+    if ($first == 253) {
+        return Span($at + 4, tcp::wire::le24($p, $at + 1) as usize);
+    }
+    return Span($at + 9, tcp::wire::le64($p, $at + 1) as usize);
+}
+
+/**
+ * The bytes of the length-encoded string at `$at`, which `layout` checked.
+ */
+internal function lenencAt(string::view $p, usize $at) : string::view
+{
+    Span $s = lenencSpan($p, $at);
+    return $p->sub($s->at, $s->size);
+}
+
+/**
+ * True when a binary temporal value of `$len` bytes is one the protocol has: 0, 4, 7 or 11 for a
+ * date or a datetime, 0, 8 or 12 for a time.
+ */
+internal function temporal(Shape $s, usize $len) : bool
+{
+    if ($s == Shape::time) {
+        return $len == 0 || $len == 8 || $len == 12;
+    }
+    return $len == 0 || $len == 4 || $len == 7 || $len == 11;
+}
+
+/**
+ * A whole row decoded into `$out` in the same pass that finds each value: the `Walk` `layout`
+ * takes, what `Row` holds. A text, decimal or bytes value shares `$packet`'s bytes; a number or
+ * a date the text protocol sent is parsed where it lies.
+ */
+internal function decodeRow(const string& $packet, const Columns& $columns, bool $binary, array<Value>& $out) : status<mysql::Error>
+{
+    string::view $p = $packet;
+    usize $n = $columns->count();
+    Walk $walk = Walk($p, $binary);
+    guard $walk->begin($n) else ($e) {
+        return .error($e);
+    }
+    usize $i = 0;
+    while ($i < $n) {
+        Shape $s = $columns->shapes[$i];
+        uint8 $w = $columns->widths[$i];
+        if (!$walk->step($i, $w, $s)) {
+            return .error($walk->failure($i));
+        }
+        if ($walk->start == NULL_AT) {
+            $out->push(Value::none);
+            $i = $i + 1;
+            continue;
+        }
+        if ($binary && $w != 0) {
+            usize $at = $walk->start as usize;
+            if ($w == LEN_BYTE) {
+                if ($s == Shape::time) {
+                    $out->push(.time(timeAt($p, $at)));
+                } else if ($s == Shape::date) {
+                    $out->push(.date(datetimeAt($p, $at)->date()));
+                } else {
+                    $out->push(.datetime(datetimeAt($p, $at)));
+                }
+            } else if ($s == Shape::signed) {
+                $out->push(.int(signedAt($p, $at, $w)));
+            } else if ($s == Shape::unsigned) {
+                $out->push(.uint(unsignedAt($p, $at, $w)));
+            } else if ($w == 4) {
+                $out->push(.float(mem::bit_cast<float32, uint32>(tcp::wire::le32($p, $at)) as float64));
+            } else {
+                $out->push(.float(mem::bit_cast<float64, uint64>(tcp::wire::le64($p, $at))));
+            }
+            $i = $i + 1;
+            continue;
+        }
+        Span $span = $walk->bytes;
+        if ($s == Shape::text) {
+            $out->push(.text($packet->sub($span->at, $span->size)));
+        } else if ($s == Shape::bytes) {
+            $out->push(.bytes($packet->sub($span->at, $span->size)));
+        } else if ($s == Shape::decimal) {
+            $out->push(.decimal($packet->sub($span->at, $span->size)));
+        } else {
+            // a number, a date or a time the text protocol sent as text: parsed, and refused
+            // when the column type cannot hold it
+            Value $v = guard textValue($columns->at($i), $s, $packet->sub($span->at, $span->size)) else ($e) {
+                return .error($e);
+            }
+            $out->push($v);
+        }
+        $i = $i + 1;
+    }
+    return .ok;
+}
+
+/**
+ * A binary-protocol integer of `$width` bytes, sign extended.
+ */
+internal function signedAt(string::view $p, usize $at, uint8 $width) : int64
+{
+    if ($width == 8) {
+        return mem::bit_cast<int64, uint64>(tcp::wire::le64($p, $at));
+    }
+    if ($width == 4) {
+        return mem::bit_cast<int32, uint32>(tcp::wire::le32($p, $at)) as int64;
+    }
+    if ($width == 2) {
+        return mem::bit_cast<int16, uint16>(tcp::wire::le16($p, $at)) as int64;
+    }
+    return mem::bit_cast<int8, uint8>($p->byte($at)) as int64;
+}
+
+internal function unsignedAt(string::view $p, usize $at, uint8 $width) : uint64
+{
+    if ($width == 8) {
+        return tcp::wire::le64($p, $at);
+    }
+    if ($width == 4) {
+        return tcp::wire::le32($p, $at) as uint64;
+    }
+    if ($width == 2) {
+        return tcp::wire::le16($p, $at) as uint64;
+    }
+    return $p->byte($at) as uint64;
+}
+
+/**
+ * A binary DATE, DATETIME or TIMESTAMP at `$at`, whose length `layout` checked.
+ */
+internal function datetimeAt(string::view $p, usize $at) : DateTime
+{
+    uint8 $len = $p->byte($at);
+    DateTime $dt = DateTime();
+    if ($len >= 4) {
+        $dt->year = tcp::wire::le16($p, $at + 1);
+        $dt->month = $p->byte($at + 3);
+        $dt->day = $p->byte($at + 4);
+    }
+    if ($len >= 7) {
+        $dt->hour = $p->byte($at + 5);
+        $dt->minute = $p->byte($at + 6);
+        $dt->second = $p->byte($at + 7);
+    }
+    if ($len >= 11) {
+        $dt->micro = tcp::wire::le32($p, $at + 8);
+    }
+    return $dt;
+}
+
+/**
+ * A binary TIME at `$at`, whose length `layout` checked.
+ */
+internal function timeAt(string::view $p, usize $at) : Time
+{
+    uint8 $len = $p->byte($at);
+    Time $t = Time();
+    if ($len >= 8) {
+        $t->negative = $p->byte($at + 1) != 0;
+        $t->hours = tcp::wire::le32($p, $at + 2) * 24 + ($p->byte($at + 6) as uint32);
+        $t->minute = $p->byte($at + 7);
+        $t->second = $p->byte($at + 8);
+    }
+    if ($len >= 12) {
+        $t->micro = tcp::wire::le32($p, $at + 9);
+    }
+    return $t;
+}
+
+/**
+ * How to read one value of a row `layout` walked: the payload, the value's start, and the plan
+ * its column has. Typed reads follow `Value`'s rules, so `RowView::int($i)` answers what
+ * `RowView::value($i)->int()` would, without building the `Value`.
+ */
+internal struct Cell
+{
+    internal string::view $p;
+    internal usize $at;
+    internal Shape $shape;
+    internal uint8 $width;
+    internal bool $binary;
+
+    /**
+     * The bytes of a length-encoded value, copied: every value of a text row, and the strings of
+     * a binary one. For a `Value`, which outlives the row.
+     */
+    internal const function owned() : string
+    {
+        return string::from(lenencAt($this->p, $this->at));
+    }
+
+    /**
+     * The same bytes, lent where they lie: no copy, valid while the row is. For a number or a
+     * date to parse from, never for anything that keeps it.
+     */
+    internal const function lent() : string
+    {
+        return string(lenencAt($this->p, $this->at));
+    }
+
+    internal const function int() : int64?
+    {
+        if ($this->shape == Shape::signed) {
+            if (!$this->binary) {
+                return str::int($this->lent());
+            }
+            int64? $n = signedAt($this->p, $this->at, $this->width);
+            return $n;
+        }
+        if ($this->shape == Shape::unsigned) {
+            uint64 $u = guard $this->uint() else {
+                return null;
+            }
+            if ($u > 9223372036854775807) {
+                return null;
+            }
+            int64? $out = $u as int64;
+            return $out;
+        }
+        return null;
+    }
+
+    internal const function uint() : uint64?
+    {
+        if ($this->shape == Shape::unsigned) {
+            if (!$this->binary) {
+                return str::uint($this->lent());
+            }
+            uint64? $u = unsignedAt($this->p, $this->at, $this->width);
+            return $u;
+        }
+        if ($this->shape == Shape::signed) {
+            int64 $n = guard $this->int() else {
+                return null;
+            }
+            if ($n < 0) {
+                return null;
+            }
+            uint64? $out = $n as uint64;
+            return $out;
+        }
+        return null;
+    }
+
+    internal const function float() : float64?
+    {
+        if ($this->shape == Shape::real) {
+            if (!$this->binary) {
+                return str::float($this->lent());
+            }
+            if ($this->width == 4) {
+                float64? $f32 = mem::bit_cast<float32, uint32>(tcp::wire::le32($this->p, $this->at)) as float64;
+                return $f32;
+            }
+            float64? $f64 = mem::bit_cast<float64, uint64>(tcp::wire::le64($this->p, $this->at));
+            return $f64;
+        }
+        if ($this->shape == Shape::decimal) {
+            return str::float($this->lent());
+        }
+        if ($this->shape == Shape::signed) {
+            int64 $n = guard $this->int() else {
+                return null;
+            }
+            float64? $fromInt = $n as float64;
+            return $fromInt;
+        }
+        if ($this->shape == Shape::unsigned) {
+            uint64 $u = guard $this->uint() else {
+                return null;
+            }
+            float64? $fromUint = $u as float64;
+            return $fromUint;
+        }
+        return null;
+    }
+
+    internal const function bool() : bool?
+    {
+        if ($this->shape == Shape::signed) {
+            int64 $n = guard $this->int() else {
+                return null;
+            }
+            bool? $fromInt = $n != 0;
+            return $fromInt;
+        }
+        if ($this->shape == Shape::unsigned) {
+            uint64 $u = guard $this->uint() else {
+                return null;
+            }
+            bool? $fromUint = $u != 0;
+            return $fromUint;
+        }
+        return null;
+    }
+
+    /**
+     * The bytes of a text, decimal or bytes value, in place.
+     */
+    internal const function text() : string::view?
+    {
+        if ($this->shape == Shape::text || $this->shape == Shape::decimal || $this->shape == Shape::bytes) {
+            string::view? $v = lenencAt($this->p, $this->at);
+            return $v;
+        }
+        return null;
+    }
+
+    /**
+     * The bytes of a bytes or text value, in place.
+     */
+    internal const function bytes() : string::view?
+    {
+        if ($this->shape == Shape::bytes || $this->shape == Shape::text) {
+            string::view? $v = lenencAt($this->p, $this->at);
+            return $v;
+        }
+        return null;
+    }
+
+    internal const function date() : Date?
+    {
+        if ($this->shape != Shape::date) {
+            return null;
+        }
+        if (!$this->binary) {
+            return Date::parse($this->lent());
+        }
+        Date? $d = datetimeAt($this->p, $this->at)->date();
+        return $d;
+    }
+
+    internal const function datetime() : DateTime?
+    {
+        if ($this->shape == Shape::datetime) {
+            if (!$this->binary) {
+                return DateTime::parse($this->lent());
+            }
+            DateTime? $dt = datetimeAt($this->p, $this->at);
+            return $dt;
+        }
+        if ($this->shape == Shape::date) {
+            Date $d = guard $this->date() else {
+                return null;
+            }
+            DateTime? $midnight = DateTime(midnight: $d);
+            return $midnight;
+        }
+        return null;
+    }
+
+    internal const function time() : Time?
+    {
+        if ($this->shape != Shape::time) {
+            return null;
+        }
+        if (!$this->binary) {
+            return Time::parse($this->lent());
+        }
+        Time? $t = timeAt($this->p, $this->at);
+        return $t;
+    }
+
+    /**
+     * The value decoded whole, as its column says. A text value the type cannot hold is
+     * `.malformed`.
+     */
+    internal const function value(const Column& $c) : result<Value, mysql::Error>
+    {
+        if (!$this->binary) {
+            // text, bytes and a decimal are kept as they are: those need their own copy
+            if ($this->shape == Shape::text || $this->shape == Shape::bytes || $this->shape == Shape::decimal) {
+                return textValue($c, $this->shape, $this->owned());
+            }
+            return textValue($c, $this->shape, $this->lent());
+        }
+        match ($this->shape) {
+            Shape::signed => {
+                return .ok(.int(signedAt($this->p, $this->at, $this->width)));
+            },
+            Shape::unsigned => {
+                return .ok(.uint(unsignedAt($this->p, $this->at, $this->width)));
+            },
+            Shape::real => {
+                float64 $f = guard $this->float();
+                return .ok(.float($f));
+            },
+            Shape::decimal => {
+                return .ok(.decimal($this->owned()));
+            },
+            Shape::date => {
+                return .ok(.date(datetimeAt($this->p, $this->at)->date()));
+            },
+            Shape::datetime => {
+                return .ok(.datetime(datetimeAt($this->p, $this->at)));
+            },
+            Shape::time => {
+                return .ok(.time(timeAt($this->p, $this->at)));
+            },
+            Shape::text => {
+                return .ok(.text($this->owned()));
+            },
+            Shape::bytes => {
+                return .ok(.bytes($this->owned()));
+            },
+        }
+    }
+}
+
+/**
+ * The type pair and the encoded bytes of one parameter, or no bytes for NULL.
+ */
+internal function putParam(const Value& $v, string& $types, string& $values) : void
+{
+    match ($v) {
+        Value::none => {
+            $types->push(TYPE_NULL);
+            $types->push(0);
+        },
+        Value::int($n) => {
+            $types->push(TYPE_LONGLONG);
+            $types->push(0);
+            int64 $signed = $n;
+            tcp::wire::putLe64($values, mem::bit_cast<uint64, int64>($signed));
+        },
+        Value::uint($n) => {
+            $types->push(TYPE_LONGLONG);
+            $types->push(128);
+            tcp::wire::putLe64($values, $n);
+        },
+        Value::float($f) => {
+            $types->push(TYPE_DOUBLE);
+            $types->push(0);
+            float64 $real = $f;
+            tcp::wire::putLe64($values, mem::bit_cast<uint64, float64>($real));
+        },
+        Value::decimal($s) => {
+            $types->push(TYPE_NEWDECIMAL);
+            $types->push(0);
+            putLenString($values, $s);
+        },
+        Value::text($s) => {
+            $types->push(TYPE_STRING);
+            $types->push(0);
+            putLenString($values, $s);
+        },
+        Value::bytes($s) => {
+            $types->push(TYPE_BLOB);
+            $types->push(0);
+            putLenString($values, $s);
+        },
+        Value::date($d) => {
+            $types->push(TYPE_DATE);
+            $types->push(0);
+            $values->push(4);
+            tcp::wire::putLe16($values, $d->year);
+            $values->push($d->month);
+            $values->push($d->day);
+        },
+        Value::datetime($d) => {
+            $types->push(TYPE_DATETIME);
+            $types->push(0);
+            if ($d->micro != 0) {
+                $values->push(11);
+            } else {
+                $values->push(7);
+            }
+            tcp::wire::putLe16($values, $d->year);
+            $values->push($d->month);
+            $values->push($d->day);
+            $values->push($d->hour);
+            $values->push($d->minute);
+            $values->push($d->second);
+            if ($d->micro != 0) {
+                tcp::wire::putLe32($values, $d->micro);
+            }
+        },
+        Value::time($t) => {
+            $types->push(TYPE_TIME);
+            $types->push(0);
+            if ($t->micro != 0) {
+                $values->push(12);
+            } else {
+                $values->push(8);
+            }
+            if ($t->negative) {
+                $values->push(1);
+            } else {
+                $values->push(0);
+            }
+            tcp::wire::putLe32($values, $t->hours / 24);
+            $values->push(($t->hours % 24) as uint8);
+            $values->push($t->minute);
+            $values->push($t->second);
+            if ($t->micro != 0) {
+                tcp::wire::putLe32($values, $t->micro);
+            }
+        },
+    }
+}
+
+/**
+ * COM_STMT_EXECUTE for statement `$id` with `$params`, in order.
+ */
+internal function execute(uint32 $id, const array<Value>& $params) : string
+{
+    string $out = '';
+    $out->push(COM_STMT_EXECUTE);
+    tcp::wire::putLe32($out, $id);
+    // no cursor, one iteration
+    $out->push(0);
+    tcp::wire::putLe32($out, 1);
+    usize $n = $params->count();
+    if ($n == 0) {
+        return $out;
+    }
+    array<uint8> $bitmap = arr::room<uint8>(($n + 7) / 8);
+    while ($bitmap->count() < ($n + 7) / 8) {
+        $bitmap->push(0);
+    }
+    string $types = '';
+    string $values = '';
+    usize $i = 0;
+    while ($i < $n) {
+        const Value& $p = $params[$i];
+        if ($p->isNull()) {
+            uint8 $bit = (1 << (($i % 8) as uint8)) as uint8;
+            $bitmap[$i / 8] = $bitmap[$i / 8] | $bit;
+        }
+        putParam($p, $types, $values);
+        $i = $i + 1;
+    }
+    foreach ($bitmap as $byte) {
+        $out->push($byte);
+    }
+    // the types follow
+    $out->push(1);
+    $out->append($types);
+    $out->append($values);
+    return $out;
+}

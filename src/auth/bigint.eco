@@ -1,0 +1,293 @@
+/**
+ * Just enough unsigned big-integer arithmetic for an RSA public-key operation: bytes in and out,
+ * multiplication, remainder (Knuth's algorithm D) and modular exponentiation. The exponent of a
+ * public key is small (65537), so square-and-multiply is all it takes. No Montgomery form and no
+ * constant-time claim: nothing secret goes through it.
+ */
+
+namespace mysql::auth;
+
+internal struct Big
+{
+    // base 2^32 digits, least significant first, no zero digits on top
+    internal array<uint32> $limbs;
+
+    /**
+     * A big-endian byte string, as DER and RSA lay numbers out.
+     */
+    internal constructor(bytes: const string& $be)
+    {
+        $this->limbs = array<uint32>();
+        usize $n = $be->size();
+        usize $i = 0;
+        uint32 $limb = 0;
+        uint32 $shift = 0;
+        while ($i < $n) {
+            uint8 $b = $be->byte($n - 1 - $i);
+            $limb = $limb | (($b as uint32) << $shift);
+            $shift = $shift + 8;
+            if ($shift == 32) {
+                $this->limbs->push($limb);
+                $limb = 0;
+                $shift = 0;
+            }
+            $i = $i + 1;
+        }
+        if ($shift > 0) {
+            $this->limbs->push($limb);
+        }
+        trim($this->limbs);
+    }
+
+    internal constructor(small: uint32 $v)
+    {
+        $this->limbs = array<uint32>();
+        if ($v != 0) {
+            $this->limbs->push($v);
+        }
+    }
+
+    internal constructor(limbs: array<uint32> $limbs)
+    {
+        $this->limbs = $limbs;
+        trim($this->limbs);
+    }
+
+    internal const function zero() : bool
+    {
+        return $this->limbs->empty();
+    }
+
+    internal const function bits() : usize
+    {
+        if ($this->limbs->empty()) {
+            return 0;
+        }
+        uint32 $top = $this->limbs[$this->limbs->count() - 1];
+        return $this->limbs->count() * 32 - (bits::leading_zeros($top) as usize);
+    }
+
+    internal const function bit(usize $i) : bool
+    {
+        usize $limb = $i / 32;
+        if ($limb >= $this->limbs->count()) {
+            return false;
+        }
+        return (($this->limbs[$limb] >> (($i % 32) as uint32)) & 1) == 1;
+    }
+
+    /**
+     * Big-endian bytes, left padded with zeros to `$size`. The number has to fit.
+     */
+    internal const function bytes(usize $size) : string
+    {
+        string $be = '';
+        $be->reserve($size);
+        usize $i = $size;
+        while ($i > 0) {
+            $i = $i - 1;
+            usize $limb = $i / 4;
+            uint8 $b = 0;
+            if ($limb < $this->limbs->count()) {
+                $b = (($this->limbs[$limb] >> ((($i % 4) * 8) as uint32)) & 255) as uint8;
+            }
+            $be->push($b);
+        }
+        return $be;
+    }
+
+    internal const function compare(const Big& $other) : int32
+    {
+        usize $a = $this->limbs->count();
+        usize $b = $other->limbs->count();
+        if ($a != $b) {
+            if ($a < $b) {
+                return -1;
+            }
+            return 1;
+        }
+        usize $i = $a;
+        while ($i > 0) {
+            $i = $i - 1;
+            uint32 $x = $this->limbs[$i];
+            uint32 $y = $other->limbs[$i];
+            if ($x != $y) {
+                if ($x < $y) {
+                    return -1;
+                }
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    internal const function times(const Big& $other) : Big
+    {
+        usize $n = $this->limbs->count();
+        usize $m = $other->limbs->count();
+        if ($n == 0 || $m == 0) {
+            return Big(small: 0);
+        }
+        array<uint32> $out = arr::room<uint32>($n + $m);
+        usize $z = 0;
+        while ($z < $n + $m) {
+            $out->push(0);
+            $z = $z + 1;
+        }
+        usize $i = 0;
+        while ($i < $n) {
+            uint64 $carry = 0;
+            uint64 $a = $this->limbs[$i] as uint64;
+            usize $j = 0;
+            while ($j < $m) {
+                uint64 $t = $a * ($other->limbs[$j] as uint64) + ($out[$i + $j] as uint64) + $carry;
+                $out[$i + $j] = ($t & 4294967295) as uint32;
+                $carry = $t >> 32;
+                $j = $j + 1;
+            }
+            $out[$i + $m] = $carry as uint32;
+            $i = $i + 1;
+        }
+        return Big(limbs: $out);
+    }
+
+    /**
+     * The remainder of this divided by `$m`, which is not zero. Knuth's algorithm D, the way
+     * Hacker's Delight writes it (divmnu).
+     */
+    internal const function mod(const Big& $m) : Big
+    {
+        if ($this->compare($m) < 0) {
+            return $this;
+        }
+        usize $n = $m->limbs->count();
+        if ($n == 1) {
+            uint64 $d = $m->limbs[0] as uint64;
+            uint64 $r = 0;
+            usize $k = $this->limbs->count();
+            while ($k > 0) {
+                $k = $k - 1;
+                $r = (($r << 32) | ($this->limbs[$k] as uint64)) % $d;
+            }
+            return Big(small: $r as uint32);
+        }
+
+        usize $len = $this->limbs->count();
+        uint32 $s = bits::leading_zeros($m->limbs[$n - 1]);
+        array<uint32> $vn = shifted($m->limbs, $s, $n);
+        array<uint32> $un = shifted($this->limbs, $s, $len + 1);
+
+        uint64 $b = 4294967296;
+        uint64 $top = $vn[$n - 1] as uint64;
+        uint64 $next = $vn[$n - 2] as uint64;
+        usize $j = $len - $n + 1;
+        while ($j > 0) {
+            $j = $j - 1;
+            uint64 $num = (($un[$j + $n] as uint64) << 32) | ($un[$j + $n - 1] as uint64);
+            uint64 $qhat = $num / $top;
+            uint64 $rhat = $num - $qhat * $top;
+            while ($qhat >= $b || $qhat * $next > (($rhat << 32) | ($un[$j + $n - 2] as uint64))) {
+                $qhat = $qhat - 1;
+                $rhat = $rhat + $top;
+                if ($rhat >= $b) {
+                    break;
+                }
+            }
+
+            // multiply and subtract
+            int64 $borrow = 0;
+            usize $i = 0;
+            while ($i < $n) {
+                uint64 $p = $qhat * ($vn[$i] as uint64);
+                int64 $t = ($un[$i + $j] as int64) - $borrow - (($p & 4294967295) as int64);
+                $un[$i + $j] = ($t & 4294967295) as uint32;
+                $borrow = (($p >> 32) as int64) - ($t >> 32);
+                $i = $i + 1;
+            }
+            int64 $last = ($un[$j + $n] as int64) - $borrow;
+            $un[$j + $n] = ($last & 4294967295) as uint32;
+
+            if ($last < 0) {
+                // qhat was one too large: add the divisor back
+                uint64 $carry = 0;
+                usize $a = 0;
+                while ($a < $n) {
+                    uint64 $sum = ($un[$a + $j] as uint64) + ($vn[$a] as uint64) + $carry;
+                    $un[$a + $j] = ($sum & 4294967295) as uint32;
+                    $carry = $sum >> 32;
+                    $a = $a + 1;
+                }
+                $un[$j + $n] = (($un[$j + $n] as uint64 + $carry) & 4294967295) as uint32;
+            }
+        }
+
+        // unnormalize the remainder
+        array<uint32> $r = arr::room<uint32>($n);
+        usize $x = 0;
+        while ($x < $n) {
+            if ($s == 0) {
+                $r->push($un[$x]);
+            } else {
+                uint64 $lo = ($un[$x] as uint64) >> ($s as uint64);
+                uint64 $hi = (($un[$x + 1] as uint64) << ((32 - $s) as uint64)) & 4294967295;
+                $r->push(($lo | $hi) as uint32);
+            }
+            $x = $x + 1;
+        }
+        return Big(limbs: $r);
+    }
+
+    /**
+     * This raised to `$e`, modulo `$m`: square and multiply, from the exponent's top bit down.
+     */
+    internal const function power(const Big& $e, const Big& $m) : Big
+    {
+        Big $base = $this->mod($m);
+        Big $acc = Big(small: 1);
+        usize $i = $e->bits();
+        while ($i > 0) {
+            $i = $i - 1;
+            $acc = $acc->times($acc)->mod($m);
+            if ($e->bit($i)) {
+                $acc = $acc->times($base)->mod($m);
+            }
+        }
+        return $acc;
+    }
+}
+
+/**
+ * Drop zero digits off the top.
+ */
+private function trim(array<uint32>& $limbs) : void
+{
+    while (!$limbs->empty() && $limbs[$limbs->count() - 1] == 0) {
+        $limbs->pop();
+    }
+}
+
+/**
+ * `$limbs` shifted left by `$s` bits (0..31), as exactly `$size` digits.
+ */
+private function shifted(const array<uint32>& $limbs, uint32 $s, usize $size) : array<uint32>
+{
+    array<uint32> $out = arr::room<uint32>($size);
+    usize $i = 0;
+    while ($i < $size) {
+        uint64 $cur = 0;
+        if ($i < $limbs->count()) {
+            $cur = $limbs[$i] as uint64;
+        }
+        uint64 $prev = 0;
+        if ($i > 0 && $i - 1 < $limbs->count()) {
+            $prev = $limbs[$i - 1] as uint64;
+        }
+        uint64 $v = ($cur << ($s as uint64)) & 4294967295;
+        if ($s > 0) {
+            $v = $v | ($prev >> ((32 - $s) as uint64));
+        }
+        $out->push($v as uint32);
+        $i = $i + 1;
+    }
+    return $out;
+}

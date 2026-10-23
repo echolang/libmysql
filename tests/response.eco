@@ -1,0 +1,226 @@
+/**
+ * The packets every command ends in (OK, ERR, EOF), the greeting and the client's answer to it, and
+ * column definitions: parsed from bytes built by hand, short and odd ones included.
+ */
+
+use mysql::protocol::{ok, err, eofStatus, terminator, ending, greeting, Greeting, response, capabilities, column, putLenenc, putLenString, putNul};
+
+internal function outcomeOf(const string& $p) : mysql::Outcome
+{
+    mysql::Outcome $o = guard ok($p) else ($e) {
+        die("ok: {$e}");
+    }
+    return $o;
+}
+
+test an_ok_packet_carries_its_counts_status_and_info
+{
+    string $p = okPacket(300, 70000, 3);
+    $p->append('Rows matched: 1');
+    mysql::Outcome $o = outcomeOf($p);
+    assert($o->affectedRows == 300);
+    assert($o->lastInsertId == 70000);
+    assert($o->inTransaction());
+    assert($o->info == 'Rows matched: 1');
+    assert(!$o->more());
+}
+
+test an_ok_packet_without_status_bytes_still_reads
+{
+    string $p = '';
+    $p->push(0);
+    putLenenc($p, 1);
+    putLenenc($p, 2);
+    mysql::Outcome $o = outcomeOf($p);
+    assert($o->affectedRows == 1 && $o->lastInsertId == 2);
+    assert($o->warnings == 0 && $o->status == 0);
+}
+
+test a_truncated_ok_packet_is_malformed
+{
+    string $p = '';
+    $p->push(0);
+    $p->push(252);
+    $p->push(1);
+    result<mysql::Outcome, mysql::Error> $r = ok($p);
+    assert($r->failed() && $r->failure()->name() == 'malformed');
+}
+
+test an_err_packet_with_and_without_a_state
+{
+    mysql::Error $e = err(errPacket(1213, '40001', 'Deadlock found'));
+    assert($e->is(.deadlock));
+    assert(($e->state() ?? '') == '40001');
+    assert($e->retryable());
+    assert("{$e}" == '1213 (40001): Deadlock found');
+
+    // an early refusal: no '#', no state
+    string $early = '';
+    $early->push(255);
+    tcp::wire::putLe16($early, 1040);
+    $early->append('Too many connections');
+    mysql::Error $refused = err($early);
+    assert($refused->is(.tooManyConnections));
+    assert(($refused->state() ?? '') == 'HY000');
+    assert("{$refused}" == '1040 (HY000): Too many connections');
+
+    // too short for a code: malformed, not a crash
+    string $stub = '';
+    $stub->push(255);
+    assert(err($stub)->name() == 'malformed');
+}
+
+test an_unnamed_error_code_keeps_its_number
+{
+    mysql::Error $e = err(errPacket(1366, 'HY000', 'Incorrect integer value'));
+    mysql::ErrorCode $c = guard $e->code();
+    assert($c->value() == 1366);
+    assert(!$e->retryable());
+}
+
+test eof_status_and_the_end_of_rows
+{
+    assert(eofStatus(eofPacket(10)) == 10);
+    string $stub = '';
+    $stub->push(254);
+    assert(eofStatus($stub) == 0);
+
+    assert(terminator(eofPacket(), false));
+    assert(terminator(okEnd(), true));
+    // a text row whose first value starts with 0xFE (an 8 byte length) is longer than 8 bytes
+    string $row = '';
+    $row->push(254);
+    $row->append(str::repeat('x', 12));
+    assert(!terminator($row, false));
+    assert(!terminator(textRowOf(['1']), true));
+    string $empty = '';
+    assert(!terminator($empty, true));
+
+    mysql::Outcome $old = guard ending(eofPacket(10), false);
+    assert($old->more());
+    string $deprecated = okEnd(10);
+    mysql::Outcome $new = guard ending($deprecated, true);
+    assert($new->more());
+}
+
+test a_greeting_reads_every_field
+{
+    Greeting $g = guard greeting(hello('caching_sha2_password')) else ($e) {
+        die("greeting: {$e}");
+    }
+    assert($g->server == '8.0.99-fake');
+    assert($g->connection == 77);
+    assert($g->scramble == scramble());
+    assert($g->capabilities == SERVER_CAPS);
+    assert($g->collation == 45);
+    assert($g->status == 2);
+    assert($g->plugin == 'caching_sha2_password');
+}
+
+test a_greeting_without_the_second_half_is_native
+{
+    // a pre-4.1 shape: version, id, 8 bytes of scramble, filler, the low capabilities, nothing else
+    string $p = '';
+    $p->push(10);
+    putNul($p, '5.0-old');
+    tcp::wire::putLe32($p, 5);
+    $p->append('abcdefgh');
+    $p->push(0);
+    tcp::wire::putLe16($p, 512);
+    Greeting $g = guard greeting($p) else ($e) {
+        die("greeting: {$e}");
+    }
+    assert($g->scramble == 'abcdefgh');
+    assert($g->plugin == 'mysql_native_password');
+    assert($g->capabilities == 512);
+}
+
+test a_greeting_that_is_not_one
+{
+    string $empty = '';
+    assert(greeting($empty)->failed());
+    string $v9 = '';
+    $v9->push(9);
+    $v9->append('old');
+    assert(greeting($v9)->failure()->name() == 'malformed');
+    assert(greeting(errPacket(1130, 'HY000', 'Host is not allowed'))->failure()->name() == 'server');
+    // cut off inside the connection id
+    string $cut = '';
+    $cut->push(10);
+    putNul($cut, '8.0');
+    $cut->append('ab');
+    assert(greeting($cut)->failure()->name() == 'malformed');
+}
+
+test the_client_asks_only_for_what_it_speaks
+{
+    uint32 $caps = capabilities(SERVER_CAPS, false, false);
+    assert(($caps & mysql::protocol::CLIENT_PROTOCOL_41) != 0);
+    assert(($caps & mysql::protocol::CLIENT_DEPRECATE_EOF) != 0);
+    assert(($caps & mysql::protocol::CLIENT_LOCAL_FILES) == 0);
+    assert(($caps & mysql::protocol::CLIENT_SSL) == 0);
+    assert(($caps & mysql::protocol::CLIENT_CONNECT_WITH_DB) == 0);
+    assert(($caps & mysql::protocol::CLIENT_MULTI_STATEMENTS) == 0);
+    uint32 $all = capabilities(SERVER_CAPS, true, true);
+    assert(($all & mysql::protocol::CLIENT_CONNECT_WITH_DB) != 0);
+    assert(($all & mysql::protocol::CLIENT_MULTI_STATEMENTS) != 0);
+    // never more than the server offers
+    assert(capabilities(mysql::protocol::CLIENT_PROTOCOL_41, true, true) == mysql::protocol::CLIENT_PROTOCOL_41);
+}
+
+test the_handshake_response_round_trips
+{
+    uint32 $caps = capabilities(SERVER_CAPS, true, false);
+    string $p = response($caps, 1024, 45, 'app', 'proof', 'shop', 'caching_sha2_password');
+    Answer $a = answer($p);
+    assert($a->caps == $caps);
+    assert($a->user == 'app');
+    assert($a->auth == 'proof');
+    assert($a->database == 'shop');
+    assert($a->plugin == 'caching_sha2_password');
+    assert(tcp::wire::le32($p, 4) == 1024);
+    assert($p->byte(8) == 45);
+    assert($p->contains('_client_name'));
+
+    // without the length-encoded auth data, the proof's size is one byte; no database, no attrs
+    uint32 $bare = mysql::protocol::CLIENT_PROTOCOL_41 | mysql::protocol::CLIENT_PLUGIN_AUTH;
+    string $q = response($bare, 1024, 45, 'u', 'xy', 'ignored', 'p');
+    string $tail = $q->sub(32, $q->size() - 32);
+    string $want = "u\0";
+    $want->push(2);
+    $want->append("xyp\0");
+    assert($tail == $want);
+}
+
+test a_column_definition_reads_every_field
+{
+    mysql::Column $c = guard column(columnDef('price', 246, mysql::protocol::FLAG_NOT_NULL | mysql::protocol::FLAG_UNSIGNED, 63)) else ($e) {
+        die("column: {$e}");
+    }
+    assert($c->name == 'price');
+    assert($c->table == 't');
+    assert($c->database == 'shop');
+    assert($c->type == mysql::ColumnType::newdecimal);
+    assert($c->charset == 63);
+    assert($c->length == 255);
+    assert($c->unsigned());
+    assert(!$c->nullable());
+    assert($c->binary());
+}
+
+test a_column_of_a_type_from_the_future_is_other
+{
+    mysql::Column $c = guard column(columnDef('v', 200));
+    assert($c->type->value() == 200);
+}
+
+test a_truncated_column_definition_is_malformed
+{
+    string $full = columnDef('name', 253);
+    usize $cut = 1;
+    while ($cut < $full->size() - 2) {
+        result<mysql::Column, mysql::Error> $r = column($full->sub(0, $cut));
+        assert($r->failed() && $r->failure()->name() == 'malformed');
+        $cut = $cut + 1;
+    }
+}

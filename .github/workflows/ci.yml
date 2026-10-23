@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2022]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: echolang/setup-echo@v1
+
+      - name: Vendor dependencies
+        run: epm install
+
+      # the protocol, auth and session tests: a scripted server, no MySQL needed
+      - name: Test
+        run: echoc test --timeout 60000
+
+  live:
+    name: live (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['mysql:8.0']
+
+    services:
+      mysql:
+        image: ${{ matrix.image }}
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: shop
+          MYSQL_USER: app
+          MYSQL_PASSWORD: secret
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysql -uroot -prootpw -h127.0.0.1 -e 'SELECT 1'"
+          --health-interval 2s --health-timeout 5s --health-retries 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: echolang/setup-echo@v1
+
+      - name: Vendor dependencies
+        run: epm install
+
+      - name: Live tests
+        env:
+          MYSQL_TEST_URL: mysql://app:secret@127.0.0.1:3306/shop
+          MYSQL_ROOT_URL: mysql://root:rootpw@127.0.0.1:3306/shop
+        run: echoc test --define mysql --timeout 120000
+
+      - name: Run the example
+        working-directory: examples
+        env:
+          MYSQL_URL: mysql://app:secret@127.0.0.1:3306/shop
+        run: |
+          epm install
+          echoc run

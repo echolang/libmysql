@@ -1,0 +1,79 @@
+internal function values(const mysql::Params& $p, const array<string>& $names, usize $count) : array<mysql::Value>
+{
+    array<mysql::Value> $out = guard $p->resolve($names, $count) else ($e) {
+        die("{$e}");
+    }
+    return $out;
+}
+
+internal function refused(const mysql::Params& $p, const array<string>& $names, usize $count) : bool
+{
+    result<array<mysql::Value>, mysql::Error> $r = $p->resolve($names, $count);
+    return $r->failed() && $r->failure()->name() == 'invalid';
+}
+
+test params_from_an_array_literal
+{
+    string? $missing = null;
+    mysql::Params $p = ['Desk', .decimal('10.00'), 3, $missing];
+    array<string> $none = [];
+    array<mysql::Value> $v = values($p, $none, 4);
+    assert(($v[0]->text() ?? '') == 'Desk');
+    assert(($v[1]->text() ?? '') == '10.00');
+    assert(($v[2]->int() ?? 0) == 3);
+    assert($v[3]->isNull());
+}
+
+test params_from_a_map_literal
+{
+    mysql::Params $p = ['name' => 'Lamp', 'price' => .decimal('49.90'), 'stock' => 12];
+    array<string> $names = ['stock', 'name', 'price', 'name'];
+    array<mysql::Value> $v = values($p, $names, 4);
+    assert(($v[0]->int() ?? 0) == 12);
+    assert(($v[1]->text() ?? '') == 'Lamp');
+    assert(($v[2]->text() ?? '') == '49.90');
+    assert(($v[3]->text() ?? '') == 'Lamp');
+}
+
+test params_leading_dot_chains
+{
+    mysql::Params $rows = .of(['Lamp', 1])->add(['Rug', 2]);
+    mysql::Params $range = .named(['min' => 0])->set('max', 100)->set(['cap' => 5]);
+    assert($rows->count() == 4);
+    assert($range->count() == 3);
+}
+
+test params_index_operators
+{
+    mysql::Params $named = [];
+    $named['a'] = 1;
+    $named['a'] = 2;
+    assert($named->count() == 1);
+
+    mysql::Params $positional = [];
+    $positional[] = 'x';
+    $positional[] = .decimal('1.50');
+    assert($positional->count() == 2);
+}
+
+test params_resolve_refuses_mismatches
+{
+    array<string> $none = [];
+    array<string> $named = ['a'];
+
+    // a map for `?` SQL, a list for `:name` SQL, and the two mixed
+    mysql::Params $map = ['a' => 1];
+    mysql::Params $list = [1];
+    mysql::Params $mixed = .of([1])->set('a', 2);
+    assert(refused($map, $none, 1));
+    assert(refused($list, $named, 1));
+    assert(refused($mixed, $named, 1));
+
+    // a missing name, a name the statement doesn't have, and the wrong count
+    mysql::Params $other = ['b' => 1];
+    mysql::Params $extra = ['a' => 1, 'aa' => 2];
+    mysql::Params $short = [1];
+    assert(refused($other, $named, 1));
+    assert(refused($extra, $named, 1));
+    assert(refused($short, $none, 2));
+}

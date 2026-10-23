@@ -1,0 +1,76 @@
+use mysql::protocol::{Cursor, putLenenc, putLenString, putNul};
+
+internal function lenencOf(uint64 $v) : string
+{
+    string $s = '';
+    putLenenc($s, $v);
+    return $s;
+}
+
+test lenenc_round_trips_every_width
+{
+    array<uint64> $values = [0, 250, 251, 65535, 65536, 16777215, 16777216, 18446744073709551615];
+    array<usize> $sizes = [1, 1, 3, 3, 4, 4, 9, 9];
+    foreach ($values as $i => $v) {
+        string $enc = lenencOf($v);
+        assert($enc->size() == $sizes[$i]);
+        Cursor $c = Cursor($enc);
+        uint64? $back = guard $c->lenenc();
+        uint64 $got = guard $back;
+        assert($got == $v);
+        assert($c->done());
+    }
+}
+
+test lenenc_0xfb_is_null
+{
+    string $s = '';
+    $s->push(251);
+    Cursor $c = Cursor($s);
+    uint64? $v = guard $c->lenenc();
+    assert($v == null);
+}
+
+test a_short_payload_is_malformed_not_a_crash
+{
+    string $s = '';
+    $s->push(254);
+    $s->push(1);
+    Cursor $c = Cursor($s);
+    result<uint64?, mysql::Error> $r = $c->lenenc();
+    assert($r->failed());
+    assert($r->failure()->name() == 'malformed');
+
+    Cursor $d = Cursor('ab');
+    assert($d->u32()->failed());
+    assert($d->at == 0);
+}
+
+test strings_read_back
+{
+    string $s = '';
+    putLenString($s, 'hello');
+    putNul($s, 'world');
+    $s->append('tail');
+    Cursor $c = Cursor($s);
+    assert($c->string()->or('') == 'hello');
+    assert($c->nul() == 'world');
+    assert($c->rest() == 'tail');
+    assert($c->done());
+}
+
+test nul_without_terminator_takes_the_rest
+{
+    Cursor $c = Cursor('plugin');
+    assert($c->nul() == 'plugin');
+    assert($c->done());
+}
+
+test fixed_ints_are_little_endian
+{
+    string $s = '';
+    tcp::wire::putLe32($s, 305419896);
+    Cursor $c = Cursor($s);
+    assert($c->u32()->or(0) == 305419896);
+    assert($s->byte(0) == 120);
+}

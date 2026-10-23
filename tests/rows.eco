@@ -1,0 +1,409 @@
+/**
+ * Rows on the wire without a server: parameters encoded for COM_STMT_EXECUTE and decoded again as
+ * a binary row, text values a column cannot hold, long length prefixes, wide results, and the
+ * ways `Row` and `ResultSet` are read.
+ */
+
+use mysql::{Value, Date, DateTime, Time, Row, Columns, ResultSet, Outcome};
+use mysql::protocol::{execute, decodeRow, putLenString};
+
+internal function raw(const array<uint8>& $bytes) : string
+{
+    string $s = '';
+    foreach ($bytes as $b) {
+        $s->push($b);
+    }
+    return $s;
+}
+
+internal function decoded(const string& $packet, const Columns& $cols, bool $binary) : array<Value>
+{
+    array<Value> $out = array<Value>();
+    guard decodeRow($packet, $cols, $binary, $out) else ($e) {
+        die("decode: {$e}");
+    }
+    return $out;
+}
+
+internal function refusedRow(const string& $packet, const Columns& $cols, bool $binary) : bool
+{
+    result<Row, mysql::Error> $r = Row::read($packet, $cols, $binary);
+    return $r->failed() && $r->failure()->name() == 'malformed';
+}
+
+internal function rowOf(const string& $packet, const Columns& $cols, bool $binary) : Row
+{
+    Row $r = guard Row::read($packet, $cols, $binary) else ($e) {
+        die("row: {$e}");
+    }
+    return $r;
+}
+
+test parameters_come_back_from_a_binary_row_as_they_went
+{
+    // every kind a parameter can be, encoded as COM_STMT_EXECUTE sends it; then the same value
+    // bytes framed as a binary row of matching columns, decoded again
+    array<Value> $params = [
+        .int(-9000000000),
+        .uint(18446744073709551615),
+        .float(-2.25),
+        .decimal('123.4500'),
+        .text('Grüße'),
+        .bytes(raw([0, 255, 1])),
+        .none,
+        .date(Date(2024, 2, 29)),
+        .datetime(DateTime(2024, 2, 29, 23, 59, 58)),
+        .datetime(DateTime(1999, 12, 31, 1, 2, 3, 456789)),
+        .time(Time(true, 49, 30, 15, 0)),
+        .time(Time(false, 0, 0, 1, 7)),
+    ];
+    array<string> $defs = [
+        columnDef('i', 8),
+        columnDef('u', 8, mysql::protocol::FLAG_UNSIGNED),
+        columnDef('f', 5),
+        columnDef('d', 246),
+        columnDef('t', 254),
+        columnDef('b', 252, 0, mysql::protocol::CHARSET_BINARY),
+        columnDef('n', 6, 0, mysql::protocol::CHARSET_BINARY),
+        columnDef('day', 10),
+        columnDef('at', 12),
+        columnDef('precise', 12),
+        columnDef('span', 11),
+        columnDef('tick', 11),
+    ];
+    Columns $cols = columnsOf($defs);
+    usize $n = $params->count();
+
+    string $exec = execute(42, $params);
+    assert($exec->byte(0) == mysql::protocol::COM_STMT_EXECUTE);
+    assert(tcp::wire::le32($exec, 1) == 42);
+    usize $bitmap = ($n + 7) / 8;
+    // parameter 6 is the NULL
+    assert($exec->byte(10) == 64 && $exec->byte(11) == 0);
+    assert($exec->byte(10 + $bitmap) == 1);
+    usize $types = 11 + $bitmap;
+    assert($exec->byte($types + 2) == 8 && $exec->byte($types + 3) == 128);
+    assert($exec->byte($types + 12) == 6);
+    string $values = $exec->sub($types + 2 * $n, $exec->size() - $types - 2 * $n);
+
+    string $row = '';
+    $row->push(0);
+    usize $rowBitmap = ($n + 9) / 8;
+    // column 6 sits at bit 8 of the row bitmap: the first bit of its second byte
+    $row->push(0);
+    $row->push(1);
+    assert($rowBitmap == 2);
+    $row->append($values);
+
+    array<Value> $back = decoded($row, $cols, true);
+    assert($back->count() == $n);
+    foreach ($params as $i => const &$p) {
+        assert($back[$i]->kind() == $p->kind());
+        assert(str::from($back[$i]) == str::from($p));
+    }
+}
+
+test execute_without_parameters_is_just_the_header
+{
+    array<Value> $none = [];
+    string $p = execute(7, $none);
+    assert($p->size() == 10);
+    assert(tcp::wire::le32($p, 1) == 7 && $p->byte(5) == 0 && tcp::wire::le32($p, 6) == 1);
+}
+
+test execute_sets_one_bit_per_null_across_bytes
+{
+    array<Value> $vals = [];
+    foreach (0 .. 17 as $i) {
+        if ($i == 0 || $i == 8 || $i == 16) {
+            $vals->push(Value::none);
+        } else {
+            $vals->push(.int(1));
+        }
+    }
+    string $p = execute(1, $vals);
+    assert($p->byte(10) == 1 && $p->byte(11) == 1 && $p->byte(12) == 1);
+    assert($p->byte(13) == 1);
+}
+
+test a_text_value_its_column_cannot_hold_is_malformed
+{
+    array<string> $defs = [
+        columnDef('u', 8, mysql::protocol::FLAG_UNSIGNED),
+        columnDef('i', 3),
+        columnDef('f', 5),
+        columnDef('day', 10),
+        columnDef('at', 12),
+        columnDef('span', 11),
+    ];
+    Columns $cols = columnsOf($defs);
+    array<string> $good = ['1', '-2', '2.5', '2024-01-02', '2024-01-02 03:04:05', '-01:02:03'];
+    array<Value> $ok = decoded(textRowOf($good), $cols, false);
+    assert(($ok[0]->uint() ?? 0) == 1 && ($ok[1]->int() ?? 0) == -2 && ($ok[2]->float() ?? 0.0) == 2.5);
+    assert($ok[3]->kind() == 'date' && $ok[4]->kind() == 'datetime' && $ok[5]->kind() == 'time');
+
+    array<string> $bad = ['-1', '2x', 'NaN?', '2024-1-2', '2024-01-02 25:00:00', '1:2:3'];
+    foreach ($bad as $i => const &$cell) {
+        array<string> $cells = $good->clone();
+        $cells[$i] = $cell;
+        assert(refusedRow(textRowOf($cells), $cols, false));
+    }
+}
+
+test text_values_with_long_length_prefixes
+{
+    array<string> $defs = [columnDef('a', 253), columnDef('b', 252), columnDef('c', 253)];
+    Columns $cols = columnsOf($defs);
+    string $mid = str::repeat('m', 300);
+    string $big = str::repeat('b', 70000);
+    string $p = '';
+    putLenString($p, $mid);
+    putLenString($p, $big);
+    putLenString($p, '');
+    assert($p->byte(0) == 252 && $p->byte(303) == 253);
+    Row $r = rowOf($p, $cols, false);
+    assert(($r['a']->text() ?? '') == $mid);
+    assert(($r['b']->text() ?? '') == $big);
+    assert(($r['c']->text() ?? 'x') == '');
+
+    // an 8 byte length
+    string $huge = '';
+    $huge->push(254);
+    tcp::wire::putLe64($huge, 3);
+    $huge->append('abc');
+    array<string> $one = [columnDef('a', 253)];
+    Columns $single = columnsOf($one);
+    assert((rowOf($huge, $single, false)[0]->text() ?? '') == 'abc');
+}
+
+test length_prefixes_that_lie_are_malformed
+{
+    array<string> $one = [columnDef('a', 253)];
+    Columns $cols = columnsOf($one);
+    // 0xFF is no length at all
+    string $ff = '';
+    $ff->push(255);
+    $ff->append('abc');
+    assert(refusedRow($ff, $cols, false));
+    // lengths longer than what follows, for each prefix width
+    string $two = '';
+    $two->push(252);
+    tcp::wire::putLe16($two, 500);
+    $two->append('abc');
+    assert(refusedRow($two, $cols, false));
+    string $three = '';
+    $three->push(253);
+    tcp::wire::putLe24($three, 70000);
+    assert(refusedRow($three, $cols, false));
+    string $eight = '';
+    $eight->push(254);
+    tcp::wire::putLe64($eight, 18446744073709551615);
+    $eight->append('abc');
+    assert(refusedRow($eight, $cols, false));
+    // the prefix itself cut short
+    string $cut = '';
+    $cut->push(253);
+    $cut->push(1);
+    assert(refusedRow($cut, $cols, false));
+    // and a row with more values than columns is fine: the rest is not read
+    assert(!refusedRow(textRowOf(['a', 'b']), $cols, false));
+    // fewer is not
+    string $none = '';
+    assert(refusedRow($none, $cols, false));
+}
+
+test a_binary_row_needs_its_whole_null_bitmap
+{
+    // seven columns: bits 2..8, two bitmap bytes
+    array<string> $defs = [];
+    foreach (0 .. 7 as $i) {
+        $defs->push(columnDef("c{$i}", 1));
+    }
+    Columns $cols = columnsOf($defs);
+    string $short = '';
+    $short->push(0);
+    $short->push(0);
+    assert(refusedRow($short, $cols, true));
+
+    // all NULL but the last, which is 0x7F
+    string $p = '';
+    $p->push(0);
+    $p->push(252);
+    $p->push(0);
+    // columns 0..5 are bits 2..7 of the first byte; column 6 is bit 0 of the second
+    $p->push(127);
+    array<Value> $v = decoded($p, $cols, true);
+    assert($v[0]->isNull() && $v[5]->isNull());
+    assert(($v[6]->int() ?? 0) == 127);
+    // a fixed width value cut short
+    string $cut = '';
+    $cut->push(0);
+    $cut->push(252);
+    $cut->push(0);
+    assert(refusedRow($cut, $cols, true));
+}
+
+test binary_integers_of_every_width_sign_extend
+{
+    array<string> $defs = [
+        columnDef('tiny', 1),
+        columnDef('short', 2),
+        columnDef('year', 13, mysql::protocol::FLAG_UNSIGNED),
+        columnDef('int24', 9),
+        columnDef('long', 3),
+        columnDef('utiny', 1, mysql::protocol::FLAG_UNSIGNED),
+        columnDef('ushort', 2, mysql::protocol::FLAG_UNSIGNED),
+        columnDef('float', 4),
+    ];
+    Columns $cols = columnsOf($defs);
+    string $p = '';
+    $p->push(0);
+    $p->push(0);
+    $p->push(0);
+    $p->push(128);
+    tcp::wire::putLe16($p, 32768);
+    tcp::wire::putLe16($p, 2024);
+    tcp::wire::putLe32($p, 4294967295);
+    tcp::wire::putLe32($p, 2147483648);
+    $p->push(255);
+    tcp::wire::putLe16($p, 65535);
+    tcp::wire::putLe32($p, 3217031168);
+    array<Value> $v = decoded($p, $cols, true);
+    assert(($v[0]->int() ?? 0) == -128);
+    assert(($v[1]->int() ?? 0) == -32768);
+    assert(($v[2]->uint() ?? 0) == 2024);
+    assert(($v[3]->int() ?? 0) == -1);
+    assert(($v[4]->int() ?? 0) == -2147483648);
+    assert(($v[5]->uint() ?? 0) == 255);
+    assert(($v[6]->uint() ?? 0) == 65535);
+    assert(($v[7]->float() ?? 0.0) == -1.5);
+}
+
+test binary_temporal_values_of_every_length
+{
+    array<string> $defs = [columnDef('zero', 12), columnDef('day', 10), columnDef('dt', 7), columnDef('none', 11)];
+    Columns $cols = columnsOf($defs);
+    string $p = '';
+    $p->push(0);
+    $p->push(0);
+    // a zero-length datetime is 0000-00-00 00:00:00
+    $p->push(0);
+    // a 4 byte date
+    $p->push(4);
+    tcp::wire::putLe16($p, 2001);
+    $p->push(9);
+    $p->push(11);
+    // a 7 byte timestamp
+    $p->push(7);
+    tcp::wire::putLe16($p, 2001);
+    $p->push(9);
+    $p->push(11);
+    $p->push(8);
+    $p->push(46);
+    $p->push(40);
+    // a zero-length time
+    $p->push(0);
+    array<Value> $v = decoded($p, $cols, true);
+    assert(str::from($v[0]) == '0000-00-00 00:00:00');
+    assert(str::from($v[1]) == '2001-09-11');
+    assert(str::from($v[2]) == '2001-09-11 08:46:40');
+    assert(str::from($v[3]) == '00:00:00');
+}
+
+test a_wide_result_finds_columns_by_name
+{
+    // past 16 columns the lookup is a map, and a name twice answers with its first
+    array<string> $defs = [];
+    foreach (0 .. 20 as $i) {
+        $defs->push(columnDef("column_{$i}", 3));
+    }
+    $defs->push(columnDef('column_3', 3));
+    Columns $cols = columnsOf($defs);
+    assert($cols->count() == 21);
+    assert(($cols->find('column_0') ?? 99) == 0);
+    assert(($cols->find('column_19') ?? 99) == 19);
+    assert(($cols->find('column_3') ?? 99) == 3);
+    assert($cols->find('column_20') == null);
+    assert($cols->find('') == null);
+    assert($cols->names()->count() == 21 && $cols->names()[20] == 'column_3');
+
+    array<string> $cells = [];
+    foreach (0 .. 21 as $c) {
+        $cells->push("{$c}");
+    }
+    Row $r = rowOf(textRowOf($cells), $cols, false);
+    assert(($r['column_19']->int() ?? 0) == 19);
+    assert(($r['column_3']->int() ?? 0) == 3);
+    assert(($r[20]->int() ?? 0) == 20);
+}
+
+test a_narrow_result_with_a_name_twice_answers_with_the_first
+{
+    array<string> $defs = [columnDef('id', 3), columnDef('name', 253), columnDef('id', 3)];
+    Columns $cols = columnsOf($defs);
+    assert(($cols->find('id') ?? 9) == 0);
+    assert($cols->find('ID') == null);
+    assert($cols->find('i') == null);
+    Row $r = rowOf(textRowOf(['1', 'Ada', '2']), $cols, false);
+    assert(($r['id']->int() ?? 0) == 1);
+    assert(($r[2]->int() ?? 0) == 2);
+}
+
+test a_row_is_read_by_name_by_position_and_by_foreach
+{
+    array<string> $defs = [columnDef('id', 3), columnDef('name', 253), columnDef('note', 253)];
+    Columns $cols = columnsOf($defs);
+    Row $r = rowOf(textRowOf(['7', 'Ada', '<NULL>']), $cols, false);
+    assert($r->count() == 3);
+    Value $name = guard $r->get('name');
+    assert(($name->text() ?? '') == 'Ada');
+    assert($r->get('missing') == null);
+    Value $note = guard $r->get('note');
+    assert($note->isNull());
+    assert(($r[0]->int() ?? 0) == 7);
+
+    array<string> $keys = [];
+    array<string> $seen = [];
+    foreach ($r as $key => const &$v) {
+        $keys->push($key);
+        $seen->push(str::from($v));
+    }
+    assert(str::join($keys, ',') == 'id,name,note');
+    assert(str::join($seen, ',') == '7,Ada,NULL');
+
+    // a copy is the same row, and outlives a reload of the original
+    Row $kept = $r;
+    guard $r->load(textRowOf(['8', 'Grace', 'x']));
+    assert(($kept['name']->text() ?? '') == 'Ada');
+    assert(($r['name']->text() ?? '') == 'Grace');
+}
+
+test a_row_reloaded_with_a_bad_packet_is_empty
+{
+    array<string> $defs = [columnDef('n', 3)];
+    Columns $cols = columnsOf($defs);
+    Row $r = rowOf(textRowOf(['1']), $cols, false);
+    assert($r->load(textRowOf(['x']))->failed());
+    assert($r->count() == 0);
+}
+
+test a_result_set_is_counted_indexed_and_walked
+{
+    array<string> $defs = [columnDef('n', 3)];
+    Columns $cols = columnsOf($defs);
+    array<Row> $rows = [rowOf(textRowOf(['1']), $cols, false), rowOf(textRowOf(['2']), $cols, false)];
+    ResultSet $rs = ResultSet($cols, $rows, Outcome());
+    assert($rs->count() == 2 && !$rs->empty());
+    Row $first = guard $rs->first();
+    assert(($first['n']->int() ?? 0) == 1);
+    assert(($rs[1]['n']->int() ?? 0) == 2);
+    int64 $sum = 0;
+    foreach ($rs as const &$row) {
+        $sum = $sum + ($row['n']->int() ?? 0);
+    }
+    assert($sum == 3);
+
+    array<Row> $none = [];
+    ResultSet $empty = ResultSet($cols, $none, Outcome());
+    assert($empty->empty() && $empty->first() == null);
+}

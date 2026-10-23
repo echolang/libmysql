@@ -1,0 +1,220 @@
+/**
+ * The oracle the row tests check `decodeRow` and `RowView` against: a second, independent decoder
+ * of both row encodings, built on `Cursor`, where every read checks its own bounds. It lives with
+ * the tests, not in the library, so the library carries one implementation of the row rules and
+ * this one only has to stay right, not fast.
+ */
+
+namespace mysql::protocol;
+
+use mysql::{Value, Column, ColumnType, Columns, DateTime, Time};
+
+internal function textRow(const string& $payload, const Columns& $columns) : result<array<Value>, mysql::Error>
+{
+    Cursor $c = Cursor($payload);
+    usize $n = $columns->count();
+    array<Value> $out = arr::room<Value>($n);
+    usize $i = 0;
+    while ($i < $n) {
+        string? $raw = guard $c->text() else ($e) {
+            return .error($e);
+        }
+        string $s = guard $raw else {
+            $out->push(Value::none);
+            $i = $i + 1;
+            continue;
+        }
+        Value $v = guard textValue($columns->at($i), shape($columns->at($i)), $s) else ($e) {
+            return .error($e);
+        }
+        $out->push($v);
+        $i = $i + 1;
+    }
+    return .ok($out);
+}
+
+/**
+ * The fixed-width integer of a binary row, signed or not by the column.
+ */
+internal function binaryInt(Cursor& $c, usize $size, bool $unsigned) : result<Value, mysql::Error>
+{
+    uint64 $raw = 0;
+    if ($size == 1) {
+        uint8 $b = guard $c->u8() else ($e) {
+            return .error($e);
+        }
+        $raw = $b as uint64;
+    } else if ($size == 2) {
+        uint16 $s = guard $c->u16() else ($e) {
+            return .error($e);
+        }
+        $raw = $s as uint64;
+    } else if ($size == 4) {
+        uint32 $w = guard $c->u32() else ($e) {
+            return .error($e);
+        }
+        $raw = $w as uint64;
+    } else {
+        uint64 $q = guard $c->u64() else ($e) {
+            return .error($e);
+        }
+        $raw = $q;
+    }
+    if ($unsigned) {
+        return .ok(.uint($raw));
+    }
+    // sign extend from the field's width
+    usize $bits = $size * 8;
+    if ($bits < 64) {
+        uint64 $sign = 1;
+        $sign = $sign << (($bits - 1) as uint64);
+        if (($raw & $sign) != 0) {
+            uint64 $fill = 18446744073709551615;
+            $raw = $raw | ($fill << ($bits as uint64));
+        }
+    }
+    return .ok(.int(mem::bit_cast<int64, uint64>($raw)));
+}
+
+/**
+ * A binary DATE, DATETIME or TIMESTAMP: a length byte (0, 4, 7 or 11) and that many bytes.
+ */
+internal function binaryDateTime(Cursor& $c) : result<DateTime, mysql::Error>
+{
+    uint8 $len = guard $c->u8() else ($e) {
+        return .error($e);
+    }
+    DateTime $dt = DateTime();
+    if ($len >= 4) {
+        $dt->year = $c->u16()->or(0);
+        $dt->month = $c->u8()->or(0);
+        $dt->day = $c->u8()->or(0);
+    }
+    if ($len >= 7) {
+        $dt->hour = $c->u8()->or(0);
+        $dt->minute = $c->u8()->or(0);
+        $dt->second = $c->u8()->or(0);
+    }
+    if ($len >= 11) {
+        $dt->micro = $c->u32()->or(0);
+    }
+    if ($len != 0 && $len != 4 && $len != 7 && $len != 11) {
+        return .error(.malformed("a datetime of {$len} bytes"));
+    }
+    return .ok($dt);
+}
+
+/**
+ * A binary TIME: a length byte (0, 8 or 12), then sign, days, hours, minutes, seconds, micros.
+ */
+internal function binaryTime(Cursor& $c) : result<Time, mysql::Error>
+{
+    uint8 $len = guard $c->u8() else ($e) {
+        return .error($e);
+    }
+    Time $t = Time();
+    if ($len >= 8) {
+        $t->negative = $c->u8()->or(0) != 0;
+        uint32 $days = $c->u32()->or(0);
+        uint8 $hours = $c->u8()->or(0);
+        $t->hours = $days * 24 + ($hours as uint32);
+        $t->minute = $c->u8()->or(0);
+        $t->second = $c->u8()->or(0);
+    }
+    if ($len >= 12) {
+        $t->micro = $c->u32()->or(0);
+    }
+    if ($len != 0 && $len != 8 && $len != 12) {
+        return .error(.malformed("a time of {$len} bytes"));
+    }
+    return .ok($t);
+}
+
+internal function binaryValue(Cursor& $c, const Column& $col) : result<Value, mysql::Error>
+{
+    ColumnType $t = $col->type;
+    bool $unsigned = $col->unsigned();
+    if ($t == ColumnType::tiny) {
+        return binaryInt($c, 1, $unsigned);
+    }
+    if ($t == ColumnType::short || $t == ColumnType::year) {
+        return binaryInt($c, 2, $unsigned);
+    }
+    if ($t == ColumnType::long || $t == ColumnType::int24) {
+        return binaryInt($c, 4, $unsigned);
+    }
+    if ($t == ColumnType::longlong) {
+        return binaryInt($c, 8, $unsigned);
+    }
+    if ($t == ColumnType::float) {
+        uint32 $bits32 = guard $c->u32() else ($e) {
+            return .error($e);
+        }
+        float32 $f32 = mem::bit_cast<float32, uint32>($bits32);
+        return .ok(.float($f32 as float64));
+    }
+    if ($t == ColumnType::double) {
+        uint64 $bits64 = guard $c->u64() else ($e) {
+            return .error($e);
+        }
+        return .ok(.float(mem::bit_cast<float64, uint64>($bits64)));
+    }
+    Shape $s = shape($col);
+    if ($s == Shape::date) {
+        DateTime $d = guard binaryDateTime($c) else ($e) {
+            return .error($e);
+        }
+        return .ok(.date($d->date()));
+    }
+    if ($s == Shape::datetime) {
+        DateTime $dt = guard binaryDateTime($c) else ($e) {
+            return .error($e);
+        }
+        return .ok(.datetime($dt));
+    }
+    if ($s == Shape::time) {
+        Time $tm = guard binaryTime($c) else ($e) {
+            return .error($e);
+        }
+        return .ok(.time($tm));
+    }
+    string $raw = guard $c->string() else ($e) {
+        return .error($e);
+    }
+    if ($s == Shape::decimal) {
+        return .ok(.decimal($raw));
+    }
+    if ($s == Shape::bytes) {
+        return .ok(.bytes($raw));
+    }
+    return .ok(.text($raw));
+}
+
+/**
+ * A binary-protocol row: `0x00`, a NULL bitmap offset by two bits, then the values.
+ */
+internal function binaryRow(const string& $payload, const Columns& $columns) : result<array<Value>, mysql::Error>
+{
+    usize $n = $columns->count();
+    usize $bitmap = ($n + 9) / 8;
+    if ($payload->size() < 1 + $bitmap) {
+        return .error(.malformed('a binary row shorter than its NULL bitmap'));
+    }
+    Cursor $c = Cursor($payload, 1 + $bitmap);
+    array<Value> $out = arr::room<Value>($n);
+    usize $i = 0;
+    while ($i < $n) {
+        usize $bit = $i + 2;
+        uint8 $mask = (1 << (($bit % 8) as uint8)) as uint8;
+        if (($payload->byte(1 + $bit / 8) & $mask) != 0) {
+            $out->push(Value::none);
+        } else {
+            Value $v = guard binaryValue($c, $columns->at($i)) else ($e) {
+                return .error($e);
+            }
+            $out->push($v);
+        }
+        $i = $i + 1;
+    }
+    return .ok($out);
+}

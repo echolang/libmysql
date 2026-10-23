@@ -1,0 +1,137 @@
+/**
+ * `str::from` for this library's types, so `"{$e}"`, `"{$value}"` and `"{$date}"` work. Own file:
+ * a namespace is a property of the file.
+ */
+
+namespace mysql;
+
+/**
+ * `$v` in decimal, zero padded on the left to `$width` digits.
+ */
+internal function padded(uint64 $v, usize $width) : string
+{
+    string $s = str::from($v);
+    if ($s->size() >= $width) {
+        return $s;
+    }
+    string $out = str::repeat('0', $width - $s->size());
+    $out->append($s);
+    return $out;
+}
+
+/**
+ * `.ffffff` for a nonzero microsecond, nothing for zero.
+ */
+internal function fraction(uint32 $micro) : string
+{
+    if ($micro == 0) {
+        return '';
+    }
+    string $out = '.';
+    $out->append(padded($micro as uint64, 6));
+    return $out;
+}
+
+namespace str;
+
+/**
+ * `"{$e}"`: the sentence.
+ */
+public function from(const mysql::Error& $e) : string
+{
+    return $e->message();
+}
+
+/**
+ * `"{$e}"`: `code (state): message`.
+ */
+public function from(const mysql::ServerError& $e) : string
+{
+    return "{$e->code->value()} ({$e->state}): {$e->message}";
+}
+
+/**
+ * `YYYY-MM-DD`.
+ */
+public function from(const mysql::Date& $d) : string
+{
+    string $out = mysql::padded($d->year as uint64, 4);
+    $out->push(45);
+    $out->append(mysql::padded($d->month as uint64, 2));
+    $out->push(45);
+    $out->append(mysql::padded($d->day as uint64, 2));
+    return $out;
+}
+
+/**
+ * `YYYY-MM-DD HH:MM:SS`, with `.ffffff` when there are microseconds.
+ */
+public function from(const mysql::DateTime& $d) : string
+{
+    string $out = str::from($d->date());
+    $out->push(32);
+    $out->append(mysql::padded($d->hour as uint64, 2));
+    $out->push(58);
+    $out->append(mysql::padded($d->minute as uint64, 2));
+    $out->push(58);
+    $out->append(mysql::padded($d->second as uint64, 2));
+    $out->append(mysql::fraction($d->micro));
+    return $out;
+}
+
+/**
+ * `[-]HH:MM:SS`, with `.ffffff` when there are microseconds.
+ */
+public function from(const mysql::Time& $t) : string
+{
+    string $out = '';
+    if ($t->negative) {
+        $out->push(45);
+    }
+    $out->append(mysql::padded($t->hours as uint64, 2));
+    $out->push(58);
+    $out->append(mysql::padded($t->minute as uint64, 2));
+    $out->push(58);
+    $out->append(mysql::padded($t->second as uint64, 2));
+    $out->append(mysql::fraction($t->micro));
+    return $out;
+}
+
+/**
+ * The value as MySQL would print it, `NULL` for NULL. Bytes print as they are.
+ */
+public function from(const mysql::Value& $v) : string
+{
+    match ($v) {
+        mysql::Value::none => {
+            return 'NULL';
+        },
+        mysql::Value::int($n) => {
+            return str::from($n);
+        },
+        mysql::Value::uint($n) => {
+            return str::from($n);
+        },
+        mysql::Value::float($n) => {
+            return str::from($n);
+        },
+        mysql::Value::decimal($s) => {
+            return $s;
+        },
+        mysql::Value::text($s) => {
+            return $s;
+        },
+        mysql::Value::bytes($s) => {
+            return $s;
+        },
+        mysql::Value::date($d) => {
+            return str::from($d);
+        },
+        mysql::Value::datetime($d) => {
+            return str::from($d);
+        },
+        mysql::Value::time($t) => {
+            return str::from($t);
+        },
+    }
+}

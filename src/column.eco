@@ -1,0 +1,204 @@
+namespace mysql;
+
+/**
+ * The type the server reports for a column. Open: a type a newer server invents still arrives
+ * as `other`, instead of failing the result. Case names are the protocol's; a few SQL names
+ * differ: `tiny` is TINYINT, `short` is SMALLINT, `long` is INT, `longlong` is BIGINT.
+ */
+public enum ColumnType : uint8
+{
+    case decimal = 0;
+    case tiny = 1;
+    case short = 2;
+    case long = 3;
+    case float = 4;
+    case double = 5;
+    case none = 6;
+    case timestamp = 7;
+    case longlong = 8;
+    case int24 = 9;
+    case date = 10;
+    case time = 11;
+    case datetime = 12;
+    case year = 13;
+    case newdate = 14;
+    case varchar = 15;
+    case bit = 16;
+    case timestamp2 = 17;
+    case datetime2 = 18;
+    case time2 = 19;
+    case vector = 242;
+    case json = 245;
+    case newdecimal = 246;
+    case enumeration = 247;
+    case set = 248;
+    case tinyBlob = 249;
+    case mediumBlob = 250;
+    case longBlob = 251;
+    case blob = 252;
+    case varString = 253;
+    case char = 254;
+    case geometry = 255;
+
+    /**
+     * A type this library does not name. `value()` is the server's number.
+     */
+    case other;
+}
+
+/**
+ * One column of a result, as the server described it.
+ */
+public struct Column
+{
+    /**
+     * Column name, as the server reported it. An alias, when the SQL used one.
+     */
+    public const string $name;
+
+    /**
+     * Table the column comes from. Empty for an expression.
+     */
+    public const string $table;
+
+    /**
+     * Database the table belongs to. Empty for an expression.
+     */
+    public const string $database;
+
+    public const ColumnType $type;
+    public const uint16 $flags;
+
+    /**
+     * Character set number. 63 is binary.
+     */
+    public const uint16 $charset;
+    public const uint32 $length;
+    public const uint8 $decimals;
+
+    public const function unsigned() : bool
+    {
+        return ($this->flags & mysql::protocol::FLAG_UNSIGNED) != 0;
+    }
+
+    public const function nullable() : bool
+    {
+        return ($this->flags & mysql::protocol::FLAG_NOT_NULL) == 0;
+    }
+
+    /**
+     * True when the column holds bytes rather than text. A BLOB, a BINARY, a VARBINARY.
+     */
+    public const function binary() : bool
+    {
+        return $this->charset == mysql::protocol::CHARSET_BINARY;
+    }
+}
+
+// up to this many columns a name lookup scans `keys`; past it, `index` answers
+internal const usize SCAN_COLUMNS = 16;
+
+/**
+ * The columns of one result, shared by every row of it.
+ */
+public class Columns
+{
+    public const array<Column> $list;
+    private map<string, usize> $index;
+
+    // how each column's values are read, worked out once per result
+    internal array<mysql::protocol::Shape> $shapes;
+    internal array<uint8> $widths;
+    // each name's size and first bytes in one word; only for a result narrow enough to scan
+    private array<uint64> $keys;
+
+    public constructor(array<Column> $list)
+    {
+        usize $n = $list->count();
+        bool $scan = $n <= SCAN_COLUMNS;
+        $this->list = $list;
+        $this->index = map<string, usize>();
+        $this->shapes = arr::room<mysql::protocol::Shape>($n);
+        $this->widths = arr::room<uint8>($n);
+        $this->keys = array<uint64>();
+        if ($scan) {
+            $this->keys->reserve($n);
+        }
+        foreach ($list as $i => $c) {
+            if ($scan) {
+                $this->keys->push(key($c->name));
+            } else if (!$this->index->has($c->name)) {
+                // a join can return one name twice: the first one answers by name
+                $this->index[$c->name] = $i;
+            }
+            $this->shapes->push(mysql::protocol::shape($c));
+            $this->widths->push(mysql::protocol::width($c));
+        }
+    }
+
+    public const function count() : usize
+    {
+        return $this->list->count();
+    }
+
+    /**
+     * Where the column called `$name` is, or null when the result has none.
+     */
+    public const function find(const string& $name) : usize?
+    {
+        usize $n = $this->list->count();
+        if ($n <= SCAN_COLUMNS) {
+            uint64 $k = key($name);
+            usize $i = 0;
+            while ($i < $n) {
+                // up to seven bytes the key is the whole name; past that, compare the rest
+                if ($this->keys[$i] == $k && ($name->size() <= 7 || $this->list[$i]->name == $name)) {
+                    usize? $found = $i;
+                    return $found;
+                }
+                $i = $i + 1;
+            }
+            return null;
+        }
+        if (!$this->index->has($name)) {
+            return null;
+        }
+        usize? $at = $this->index->get($name);
+        return $at;
+    }
+
+    public const function at(usize $i) : const Column&
+    {
+        return $this->list[$i];
+    }
+
+    public const function names() : array<string>
+    {
+        array<string> $out = arr::room<string>($this->list->count());
+        foreach ($this->list as $c) {
+            $out->push($c->name);
+        }
+        return $out;
+    }
+}
+
+/**
+ * A column name in one word: size in the top byte, first seven bytes below. Equal keys of seven
+ * bytes or fewer are the same name. A size of 255 or more stores as 255, so two long names can
+ * share a key (they compare in full anyway) and a long one never matches a short one.
+ */
+internal function key(const string& $name) : uint64
+{
+    usize $n = $name->size();
+    usize $top = $n;
+    if ($top > 255) {
+        $top = 255;
+    }
+    uint64 $k = ($top as uint64) << 56;
+    usize $i = 0;
+    while ($i < $n && $i < 7) {
+        $k = $k | (($name->byte($i) as uint64) << (($i * 8) as uint64));
+        $i = $i + 1;
+    }
+    return $k;
+}

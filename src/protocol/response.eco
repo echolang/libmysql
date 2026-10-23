@@ -1,0 +1,86 @@
+/**
+ * The generic response packets: OK, ERR and EOF, and telling a row from the end of the rows.
+ */
+
+namespace mysql::protocol;
+
+/**
+ * An OK packet (`0x00`, or `0xFE` where it ends a result set under DEPRECATE_EOF).
+ */
+internal function ok(const string& $payload) : result<mysql::Outcome, mysql::Error>
+{
+    Cursor $c = Cursor($payload, 1);
+    uint64 $affected = guard $c->count() else ($e) {
+        return .error($e);
+    }
+    uint64 $id = guard $c->count() else ($e) {
+        return .error($e);
+    }
+    uint16 $status = 0;
+    uint16 $warnings = 0;
+    if ($c->left() >= 4) {
+        $status = $c->u16()->or(0);
+        $warnings = $c->u16()->or(0);
+    }
+    string $info = $c->rest();
+    return .ok(mysql::Outcome($affected, $id, $warnings, $info, $status));
+}
+
+/**
+ * An ERR packet (`0xFF`) as the error it carries. A packet too short to read is still an error,
+ * just a less specific one.
+ */
+internal function err(const string& $payload) : mysql::Error
+{
+    Cursor $c = Cursor($payload, 1);
+    uint16 $code = guard $c->u16() else ($e) {
+        return $e;
+    }
+    string $state = 'HY000';
+    // before the capabilities are agreed, an early refusal has no '#' and no state
+    if (!$c->done() && $c->peek() == 35) {
+        $c->at = $c->at + 1;
+        $state = $c->bytes(5)->or('HY000');
+    }
+    string $message = $c->rest();
+    return .server(mysql::ServerError(mysql::ErrorCode::from($code), $state, $message));
+}
+
+/**
+ * The status bits of an EOF packet (`0xFE`, warnings then status).
+ */
+internal function eofStatus(const string& $payload) : uint16
+{
+    if ($payload->size() < 5) {
+        return 0;
+    }
+    return tcp::wire::le16($payload, 3);
+}
+
+/**
+ * True when `$payload` ends the rows of a result set. A row can start with `0xFE` too (an 8-byte
+ * length prefix), so the size decides: an EOF packet is under 9 bytes, and the OK that replaces
+ * it under DEPRECATE_EOF is under the 16 MiB a row starting so would need.
+ */
+internal function terminator(string::view $payload, bool $deprecateEof) : bool
+{
+    if ($payload->empty() || $payload->byte(0) != HEADER_EOF) {
+        return false;
+    }
+    if ($deprecateEof) {
+        return $payload->size < PACKET_MAX;
+    }
+    return $payload->size < 9;
+}
+
+/**
+ * The end of a result set as an `Outcome`: an EOF packet's status, or the OK packet's whole
+ * content.
+ */
+internal function ending(const string& $payload, bool $deprecateEof) : result<mysql::Outcome, mysql::Error>
+{
+    if ($deprecateEof) {
+        return ok($payload);
+    }
+    return .ok(mysql::Outcome($status: eofStatus($payload)));
+}

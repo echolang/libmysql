@@ -1,0 +1,868 @@
+namespace mysql;
+
+use std::time;
+use mysql::protocol::{Cursor, Placeholders};
+
+/**
+ * How a result starts: with an OK (no rows), or with its columns.
+ */
+internal enum Head
+{
+    case done(Outcome $outcome);
+    case rows(Columns $columns);
+}
+
+/**
+ * A statement the server holds: its id, how many values it takes and their names, and its
+ * columns.
+ */
+internal struct Prepared
+{
+    internal uint32 $id;
+    internal usize $params;
+    internal array<string> $names;
+    internal Columns $columns;
+}
+
+// most columns a result may announce; MySQL allows 4096 in a table and 65535 in a prepare
+internal const uint64 MAX_COLUMNS = 65535;
+
+#[docs::groups: ["Opening", "Queries", "Statements", "Transactions", "Session"]]
+#[docs::see: ["mysql::Pool", "mysql::Statement"]]
+
+/**
+ * One session with a MySQL server. Use it from one thread at a time. `#[atomic]` so a pool can
+ * hand it from one thread to the next.
+ *
+ * ```echo
+ * mysql::Connection $db = guard
+ *     mysql::Connection::open($url);
+ * echo $db->id;               // 12
+ * ```
+ */
+#[atomic]
+public class Connection
+{
+    /**
+     * The server's version string.
+     */
+    #[docs::group: "Session"]
+    public const string $server;
+
+    /**
+     * The connection id the server gave this session. What `KILL` takes.
+     */
+    #[docs::group: "Session"]
+    public const uint32 $id;
+
+    #[docs::group: "Session"]
+    public const Plugin $plugin;
+
+    internal Channel $channel;
+    internal Options $options;
+    internal uint32 $caps;
+    private uint16 $status;
+    internal bool $busy;
+    // how the last result ended
+    internal Outcome $ending;
+    private map<string, Prepared> $cache;
+
+    internal constructor(string $server, uint32 $id, Plugin $plugin, Channel $channel, Options $options, uint32 $caps, uint16 $status)
+    {
+        $this->server = $server;
+        $this->id = $id;
+        $this->plugin = $plugin;
+        $this->channel = $channel;
+        $this->options = $options;
+        $this->caps = $caps;
+        $this->status = $status;
+        $this->busy = false;
+        $this->ending = Outcome();
+        $this->cache = map<string, Prepared>();
+    }
+
+    destructor()
+    {
+        if ($this->channel->alive() && !$this->busy) {
+            $this->quit(tcp::Deadline(ms: 1000));
+        }
+    }
+
+    /**
+     * Connect to the server a URL names: `mysql://user:password@host:port/database?...`.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const string& $url) : result<Connection, Error>
+    {
+        Options $o = guard Options::parse($url) else ($e) {
+            return .error($e);
+        }
+        return Connection::open($o);
+    }
+
+    /**
+     * Connect and log in, all within `connectTimeout`.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const Options& $o) : result<Connection, Error>
+    {
+        tcp::Deadline $by = tcp::Deadline(after: $o->connectTimeout);
+        tcp::Stream $stream = guard dial($o, $by) else ($e) {
+            return .error($e);
+        }
+        Channel $ch = Channel($stream, $o->maxPacket);
+        string $hello = guard $ch->read($by) else ($e) {
+            return .error($e);
+        }
+        mysql::protocol::Greeting $g = guard mysql::protocol::greeting($hello) else ($e) {
+            $ch->close();
+            return .error($e);
+        }
+        uint32 $caps = mysql::protocol::capabilities($g->capabilities, $o->database != null, $o->multiStatements);
+        if (($caps & mysql::protocol::CLIENT_PROTOCOL_41) == 0) {
+            $ch->close();
+            return .error(.invalid('the server does not speak the 4.1 protocol'));
+        }
+
+        Login $login = Login($ch, $o, $g->scramble, $by);
+        // unknown default plugin still gets a caching_sha2 answer: the server switches us to
+        // the user's real plugin when it differs
+        Plugin $first = Plugin::named($g->plugin) ?? Plugin::cachingSha2;
+        string $proof = guard $login->proof($first) else ($e) {
+            $ch->close();
+            return .error($e);
+        }
+        string $db = $o->database ?? '';
+        string $hi = mysql::protocol::response($caps, $o->maxPacket as uint32, $o->collation, $o->user, $proof, $db, $first->value());
+        guard $ch->write($hi, $by) else ($e) {
+            return .error($e);
+        }
+        Outcome $ok = guard $login->run() else ($e) {
+            $ch->close();
+            return .error($e);
+        }
+        return .ok(Connection($g->server, $g->connection, $login->plugin, $ch, $o, $caps, $ok->status));
+    }
+
+    /**
+     * True when the socket is still open. Does not talk to the server; `ping` does.
+     */
+    #[docs::group: "Session"]
+    public const function alive() : bool
+    {
+        return $this->channel->alive();
+    }
+
+    /**
+     * True when a transaction is open, by the server's own account after the last command.
+     */
+    #[docs::group: "Transactions"]
+    public const function inTransaction() : bool
+    {
+        return ($this->status & mysql::protocol::SERVER_STATUS_IN_TRANS) != 0;
+    }
+
+    // query: the whole result, read into memory
+
+    /**
+     * Run `$sql` and read the whole result. No values, so the text protocol.
+     */
+    #[docs::group: "Queries"]
+    public function query(const string& $sql, by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        Params? $none = null;
+        return $this->fetch($sql, $none, $by);
+    }
+
+    /**
+     * Run `$sql` with `$params` and read the whole result. A prepared statement, cached.
+     */
+    #[docs::group: "Queries"]
+    public function query(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        Params? $p = $params;
+        return $this->fetch($sql, $p, $by);
+    }
+
+    // exec: what a statement that returns no rows did
+
+    /**
+     * Run `$sql` and return what it did. No values, so the text protocol.
+     */
+    #[docs::group: "Queries"]
+    public function exec(const string& $sql, by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        Params? $none = null;
+        return $this->apply($sql, $none, $by);
+    }
+
+    /**
+     * Run `$sql` with `$params` and return what it did. A prepared statement, cached.
+     */
+    #[docs::group: "Queries"]
+    public function exec(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        Params? $p = $params;
+        return $this->apply($sql, $p, $by);
+    }
+
+    // stream: rows one at a time, without buffering the result
+
+    /**
+     * Run `$sql` and read rows one at a time. No values, so the text protocol.
+     */
+    #[docs::group: "Queries"]
+    public function stream(const string& $sql, by: tcp::Deadline? $by = null) : result<Rows, Error>
+    {
+        Params? $none = null;
+        return $this->open($sql, $none, $by);
+    }
+
+    /**
+     * Run `$sql` with `$params` and read rows one at a time. A prepared statement, cached.
+     */
+    #[docs::group: "Queries"]
+    public function stream(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<Rows, Error>
+    {
+        Params? $p = $params;
+        return $this->open($sql, $p, $by);
+    }
+
+    // batch and prepare
+
+    /**
+     * Every result of a multi-statement query (or a CALL that returns several), in order. Needs
+     * `Options->multiStatements` for more than one statement.
+     */
+    #[docs::group: "Queries"]
+    public function batch(const string& $sql, by: tcp::Deadline? $by = null) : result<array<ResultSet>, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        guard $this->text($sql, $until) else ($e) {
+            return .error($e);
+        }
+        array<ResultSet> $sets = array<ResultSet>();
+        while (true) {
+            ResultSet $rs = guard $this->collect(false, $until) else ($e) {
+                return .error($e);
+            }
+            $sets->push($rs);
+            if (!$rs->outcome->more()) {
+                return .ok($sets);
+            }
+        }
+    }
+
+    /**
+     * A statement prepared on the server, to run many times.
+     */
+    #[docs::group: "Statements"]
+    public function prepare(const string& $sql, by: tcp::Deadline? $by = null) : result<Statement, Error>
+    {
+        // its own statement, never the cache's: closing it must not pull one out from under a query
+        Prepared $p = guard $this->prepareNow($sql, $this->deadline($by)) else ($e) {
+            return .error($e);
+        }
+        return .ok(Statement($this, $p));
+    }
+
+    // transactions
+
+    /**
+     * Start a transaction. Dropping the `Transaction` without `commit()` rolls it back.
+     */
+    #[docs::group: "Transactions"]
+    public function begin(by: tcp::Deadline? $by = null) : result<Transaction, Error>
+    {
+        guard $this->exec('START TRANSACTION', by: $by) else ($e) {
+            return .error($e);
+        }
+        return .ok(Transaction($this));
+    }
+
+    /**
+     * Run `$work` in a transaction: commit on ok, roll back on error (and hand that error on).
+     */
+    #[docs::group: "Transactions"]
+    public function transaction(function<status<Error>(Connection)> $work, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        guard $this->transact<bool>(function(Connection $c) : result<bool, Error> {
+            guard $work($c) else ($e) {
+                return .error($e);
+            }
+            return .ok(true);
+        }, $by) else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    }
+
+    /**
+     * Run `$work` in a transaction and hand back its value: commit on ok, roll back on error.
+     */
+    #[docs::group: "Transactions"]
+    public function transaction<T>(function<result<T, Error>(Connection)> $work, by: tcp::Deadline? $by = null) : result<T, Error>
+    {
+        return $this->transact<T>($work, $by);
+    }
+
+    /**
+     * What `transaction<T>` does, under its own name. A generic body that calls an overloaded
+     * generic method by type parameter hits the non-generic overload (echoc 0.9), so `Pool`
+     * calls this one.
+     */
+    internal function transact<T>(function<result<T, Error>(Connection)> $work, tcp::Deadline? $by) : result<T, Error>
+    {
+        Transaction $tx = guard $this->begin(by: $by) else ($e) {
+            return .error($e);
+        }
+        result<T, Error> $done = $work($this);
+        if ($done->failed()) {
+            Error $why = $done->failure();
+            $tx->rollback(by: $by);
+            return .error($why);
+        }
+        guard $tx->commit(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $done;
+    }
+
+    // the session
+
+    /**
+     * Check that the server is still there.
+     */
+    #[docs::group: "Session"]
+    public function ping(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->simple(mysql::protocol::COM_PING, '', $by);
+    }
+
+    /**
+     * Reset the session: roll back, drop temporary tables, user variables and prepared
+     * statements. As if newly connected, without logging in again.
+     */
+    #[docs::group: "Session"]
+    public function reset(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        guard $this->simple(mysql::protocol::COM_RESET_CONNECTION, '', $by) else ($e) {
+            return .error($e);
+        }
+        $this->cache->clear();
+        return .ok;
+    }
+
+    /**
+     * Make `$name` the default database. What the `USE` statement does.
+     */
+    #[docs::group: "Session"]
+    public function database(const string& $name, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return $this->simple(mysql::protocol::COM_INIT_DB, $name, $by);
+    }
+
+    /**
+     * Say goodbye and close. Safe to call twice.
+     */
+    #[docs::group: "Session"]
+    public function close() : void
+    {
+        if ($this->channel->alive()) {
+            $this->quit(tcp::Deadline(ms: 1000));
+        }
+        $this->channel->close();
+    }
+
+    // the plumbing below
+
+    private function quit(tcp::Deadline $by) : void
+    {
+        string $bye = '';
+        $bye->push(mysql::protocol::COM_QUIT);
+        status<Error> $sent = $this->channel->command($bye, $by);
+        $this->channel->finish($by);
+    }
+
+    /**
+     * The call's deadline: the one it named, else `Options->timeout` from now, else never.
+     */
+    internal const function deadline(tcp::Deadline? $by) : tcp::Deadline
+    {
+        tcp::Deadline? $given = $by;
+        if ($given != null) {
+            tcp::Deadline $d = guard $given;
+            return $d;
+        }
+        time::duration? $t = $this->options->timeout;
+        if ($t == null) {
+            return tcp::Deadline::never();
+        }
+        time::duration $span = guard $t;
+        return tcp::Deadline(after: $span);
+    }
+
+    /**
+     * Whether a command may start now.
+     */
+    internal const function ready() : status<Error>
+    {
+        if ($this->busy) {
+            return .error(.busy);
+        }
+        if (!$this->channel->alive()) {
+            return .error(.closed);
+        }
+        return .ok;
+    }
+
+    /**
+     * A command that failed partway through its answer. An error packet or a refused local file
+     * ends the command, connection still ready. Anything else may still be on the wire, so the
+     * connection closes: leftover bytes would be the next command's answer.
+     */
+    internal function abandon(const Error& $e) : void
+    {
+        match ($e) {
+            Error::server($s) => {
+                return;
+            },
+            Error::localInfile => {
+                return;
+            },
+            else => {
+                $this->channel->close();
+            },
+        }
+    }
+
+    internal function track(const Outcome& $o) : void
+    {
+        $this->status = $o->status;
+        $this->ending = $o;
+    }
+
+    /**
+     * A command answered by a lone OK or ERR.
+     */
+    private function simple(uint8 $command, const string& $arg, tcp::Deadline? $by) : status<Error>
+    {
+        guard $this->ready() else ($e) {
+            return .error($e);
+        }
+        tcp::Deadline $until = $this->deadline($by);
+        string $p = '';
+        $p->push($command);
+        $p->append($arg);
+        guard $this->channel->command($p, $until) else ($e) {
+            return .error($e);
+        }
+        string $reply = guard $this->channel->read($until) else ($e) {
+            return .error($e);
+        }
+        if (!$reply->empty() && $reply->byte(0) == mysql::protocol::HEADER_ERR) {
+            return .error(mysql::protocol::err($reply));
+        }
+        Outcome $ok = guard mysql::protocol::ok($reply) else ($e) {
+            return .error($e);
+        }
+        $this->track($ok);
+        return .ok;
+    }
+
+    internal function text(const string& $sql, tcp::Deadline $by) : status<Error>
+    {
+        guard $this->ready() else ($e) {
+            return .error($e);
+        }
+        string $p = '';
+        $p->reserve($sql->size() + 1);
+        $p->push(mysql::protocol::COM_QUERY);
+        $p->append($sql);
+        return $this->channel->command($p, $by);
+    }
+
+    /**
+     * Send `$sql` as text, or with values as an execute of its prepared statement. True when the
+     * answer comes in the binary protocol.
+     */
+    internal function start(const string& $sql, Params? $params, tcp::Deadline $by) : result<bool, Error>
+    {
+        Params $p = guard $params else {
+            guard $this->text($sql, $by) else ($e) {
+                return .error($e);
+            }
+            return .ok(false);
+        }
+        if ($p->count() == 0) {
+            // empty chain: nothing to bind, but still checked
+            array<string> $none = array<string>();
+            guard $p->resolve($none, 0) else ($e) {
+                return .error($e);
+            }
+            guard $this->text($sql, $by) else ($e) {
+                return .error($e);
+            }
+            return .ok(false);
+        }
+        Prepared $st = guard $this->prepared($sql, $by) else ($e) {
+            return .error($e);
+        }
+        guard $this->execute($st, $p, $by) else ($e) {
+            return .error($e);
+        }
+        return .ok(true);
+    }
+
+    /**
+     * Send COM_STMT_EXECUTE for `$st` with `$params`.
+     */
+    internal function execute(const Prepared& $st, const Params& $params, tcp::Deadline $by) : status<Error>
+    {
+        guard $this->ready() else ($e) {
+            return .error($e);
+        }
+        array<Value> $values = guard $params->resolve($st->names, $st->params) else ($e) {
+            return .error($e);
+        }
+        return $this->channel->command(mysql::protocol::execute($st->id, $values), $by);
+    }
+
+    private function fetch(const string& $sql, Params? $params, tcp::Deadline? $by) : result<ResultSet, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        bool $binary = guard $this->start($sql, $params, $until) else ($e) {
+            return .error($e);
+        }
+        return $this->first($binary, $until);
+    }
+
+    private function apply(const string& $sql, Params? $params, tcp::Deadline? $by) : result<Outcome, Error>
+    {
+        ResultSet $rs = guard $this->fetch($sql, $params, $by) else ($e) {
+            return .error($e);
+        }
+        return .ok($rs->outcome);
+    }
+
+    private function open(const string& $sql, Params? $params, tcp::Deadline? $by) : result<Rows, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        bool $binary = guard $this->start($sql, $params, $until) else ($e) {
+            return .error($e);
+        }
+        return Rows::begin($this, $binary, $until);
+    }
+
+    /**
+     * The first result of the command just sent, read whole. Further results are read and dropped
+     * so the connection is ready again.
+     */
+    internal function first(bool $binary, tcp::Deadline $by) : result<ResultSet, Error>
+    {
+        ResultSet $rs = guard $this->collect($binary, $by) else ($e) {
+            return .error($e);
+        }
+        bool $more = $rs->outcome->more();
+        while ($more) {
+            ResultSet $next = guard $this->collect($binary, $by) else ($e) {
+                return .error($e);
+            }
+            $more = $next->outcome->more();
+        }
+        return .ok($rs);
+    }
+
+    /**
+     * One result, read whole.
+     */
+    internal function collect(bool $binary, tcp::Deadline $by) : result<ResultSet, Error>
+    {
+        Head $head = guard $this->head($by) else ($e) {
+            $this->abandon($e);
+            return .error($e);
+        }
+        match ($head) {
+            Head::done($o) => {
+                Outcome $outcome = $o;
+                return .ok(ResultSet(Columns(array<Column>()), array<Row>(), $outcome));
+            },
+            Head::rows($c) => {
+                Columns $columns = $c;
+                array<Row> $rows = array<Row>();
+                while (true) {
+                    string::view? $next = guard $this->packet($by) else ($e) {
+                        $this->abandon($e);
+                        return .error($e);
+                    }
+                    string::view $p = guard $next else {
+                        break;
+                    }
+                    Row $row = guard Row::read($p, $columns, $binary) else ($e) {
+                        $this->abandon($e);
+                        return .error($e);
+                    }
+                    $rows->push($row);
+                }
+                return .ok(ResultSet($columns, $rows, $this->ending));
+            },
+        }
+    }
+
+    /**
+     * The start of a result: an OK, or the column definitions.
+     */
+    internal function head(tcp::Deadline $by) : result<Head, Error>
+    {
+        string $p = guard $this->channel->read($by) else ($e) {
+            return .error($e);
+        }
+        if ($p->empty()) {
+            return .error(.malformed('an empty response'));
+        }
+        uint8 $h = $p->byte(0);
+        if ($h == mysql::protocol::HEADER_OK) {
+            Outcome $ok = guard mysql::protocol::ok($p) else ($e) {
+                return .error($e);
+            }
+            $this->track($ok);
+            return .ok(.done($ok));
+        }
+        if ($h == mysql::protocol::HEADER_ERR) {
+            return .error(mysql::protocol::err($p));
+        }
+        if ($h == mysql::protocol::HEADER_LOCAL_INFILE) {
+            // refuse the file: an empty packet, then the server's answer to that
+            string $nothing = '';
+            guard $this->channel->write($nothing, $by) else ($e) {
+                return .error($e);
+            }
+            string $reply = guard $this->channel->read($by) else ($e) {
+                return .error($e);
+            }
+            if (!$reply->empty() && $reply->byte(0) == mysql::protocol::HEADER_OK) {
+                Outcome $after = guard mysql::protocol::ok($reply) else ($e) {
+                    return .error($e);
+                }
+                $this->track($after);
+                if ($after->more()) {
+                    // more results follow and the caller stops here: they would be read as the
+                    // next command's answer
+                    $this->channel->close();
+                }
+            }
+            return .error(.localInfile);
+        }
+        Cursor $c = Cursor($p);
+        uint64 $count = guard $c->count() else ($e) {
+            return .error($e);
+        }
+        // a count is read before anything is sized by it: no server sends this many columns
+        if ($count > MAX_COLUMNS) {
+            return .error(.malformed("a result of {$count} columns"));
+        }
+        Columns $columns = guard $this->definitions($count as usize, $by) else ($e) {
+            return .error($e);
+        }
+        return .ok(.rows($columns));
+    }
+
+    /**
+     * `$count` column definitions, and the EOF after them when the server still sends one.
+     */
+    internal function definitions(usize $count, tcp::Deadline $by) : result<Columns, Error>
+    {
+        array<Column> $list = arr::room<Column>($count);
+        usize $i = 0;
+        while ($i < $count) {
+            string $def = guard $this->channel->read($by) else ($e) {
+                return .error($e);
+            }
+            Column $col = guard mysql::protocol::column($def) else ($e) {
+                return .error($e);
+            }
+            $list->push($col);
+            $i = $i + 1;
+        }
+        if ($count > 0 && !$this->deprecateEof()) {
+            guard $this->channel->read($by) else ($e) {
+                return .error($e);
+            }
+        }
+        return .ok(Columns($list));
+    }
+
+    /**
+     * The next row's packet in place when it has arrived whole and is a row. Null when `packet`
+     * has to look: end of the rows, an error, or a packet still coming.
+     */
+    internal function arrived() : string::view?
+    {
+        return $this->channel->row();
+    }
+
+    /**
+     * The next row's packet, undecoded and in place, or null at the end of the rows (`ending`
+     * holds how it ended). The view holds until the next read on this connection.
+     */
+    internal function packet(tcp::Deadline $by) : result<string::view?, Error>
+    {
+        string::view? $end = null;
+        string::view $p = guard $this->channel->next($by) else ($e) {
+            return .error($e);
+        }
+        if ($p->empty()) {
+            return .error(.malformed('an empty row'));
+        }
+        if (mysql::protocol::terminator($p, $this->deprecateEof())) {
+            string $last = string::from($p);
+            Outcome $o = guard mysql::protocol::ending($last, $this->deprecateEof()) else ($e) {
+                return .error($e);
+            }
+            $this->track($o);
+            return .ok($end);
+        }
+        if ($p->byte(0) == mysql::protocol::HEADER_ERR) {
+            return .error(mysql::protocol::err(string::from($p)));
+        }
+        string::view? $row = $p;
+        return .ok($row);
+    }
+
+    internal const function deprecateEof() : bool
+    {
+        return ($this->caps & mysql::protocol::CLIENT_DEPRECATE_EOF) != 0;
+    }
+
+    /**
+     * The prepared statement for `$sql`, from the cache or prepared now.
+     */
+    internal function prepared(const string& $sql, tcp::Deadline $by) : result<Prepared, Error>
+    {
+        if ($this->cache->has($sql)) {
+            return .ok($this->cache->get($sql));
+        }
+        if ($this->cache->count() >= $this->options->statementCache && $this->options->statementCache > 0) {
+            // full: drop them all. Simpler than tracking use, and it rarely matters
+            foreach ($this->cache->values() as $old) {
+                $this->release($old->id, $by);
+            }
+            $this->cache->clear();
+        }
+        Prepared $p = guard $this->prepareNow($sql, $by) else ($e) {
+            return .error($e);
+        }
+        if ($this->options->statementCache > 0) {
+            $this->cache[$sql] = $p;
+        }
+        return .ok($p);
+    }
+
+    /**
+     * COM_STMT_PREPARE, with named placeholders rewritten first.
+     */
+    internal function prepareNow(const string& $sql, tcp::Deadline $by) : result<Prepared, Error>
+    {
+        guard $this->ready() else ($e) {
+            return .error($e);
+        }
+        Placeholders $ph = guard mysql::protocol::placeholders($sql) else ($e) {
+            return .error($e);
+        }
+        string $cmd = '';
+        $cmd->push(mysql::protocol::COM_STMT_PREPARE);
+        $cmd->append($ph->sql);
+        guard $this->channel->command($cmd, $by) else ($e) {
+            return .error($e);
+        }
+        Prepared $st = guard $this->prepareAnswer($ph, $by) else ($e) {
+            // the definitions may still be on their way: only an error packet ends the answer
+            $this->abandon($e);
+            return .error($e);
+        }
+        if (!$ph->names->empty() && $ph->names->count() != $st->params) {
+            $this->release($st->id, $by);
+            return .error(.invalid("the server counts {$st->params} placeholders, the SQL names {$ph->names->count()}"));
+        }
+        return .ok($st);
+    }
+
+    /**
+     * The answer to COM_STMT_PREPARE: the statement's id and counts, then the definitions of its
+     * placeholders and of its columns.
+     */
+    private function prepareAnswer(const Placeholders& $ph, tcp::Deadline $by) : result<Prepared, Error>
+    {
+        string $p = guard $this->channel->read($by) else ($e) {
+            return .error($e);
+        }
+        if ($p->empty()) {
+            return .error(.malformed('an empty prepare response'));
+        }
+        if ($p->byte(0) == mysql::protocol::HEADER_ERR) {
+            return .error(mysql::protocol::err($p));
+        }
+        Cursor $c = Cursor($p, 1);
+        uint32 $id = guard $c->u32() else ($e) {
+            return .error($e);
+        }
+        uint16 $columns = guard $c->u16() else ($e) {
+            return .error($e);
+        }
+        uint16 $params = guard $c->u16() else ($e) {
+            return .error($e);
+        }
+        guard $this->definitions($params as usize, $by) else ($e) {
+            return .error($e);
+        }
+        Columns $cols = guard $this->definitions($columns as usize, $by) else ($e) {
+            return .error($e);
+        }
+        return .ok(Prepared($id, $params as usize, $ph->names, $cols));
+    }
+
+    /**
+     * COM_STMT_CLOSE. The server sends nothing back.
+     */
+    internal function release(uint32 $id, tcp::Deadline $by) : void
+    {
+        if (!$this->channel->alive() || $this->busy) {
+            return;
+        }
+        string $p = '';
+        $p->push(mysql::protocol::COM_STMT_CLOSE);
+        tcp::wire::putLe32($p, $id);
+        status<Error> $sent = $this->channel->command($p, $by);
+    }
+}
+
+/**
+ * The stream to the server the options name: its unix socket, or its host and port.
+ */
+internal function dial(const Options& $o, tcp::Deadline $by) : result<tcp::Stream, Error>
+{
+    string? $socket = $o->socket;
+    if ($socket != null) {
+        string $path = guard $socket;
+        tcp::Stream $u = guard tcp::Stream::connect(tcp::Address(unix: $path), $by) else ($e) {
+            return .error(transportError($e));
+        }
+        return .ok($u);
+    }
+    tcp::Stream $s = guard tcp::Stream::connect(host: $o->host, $o->port, $by) else ($e) {
+        return .error(transportError($e));
+    }
+    return .ok($s);
+}
+
+internal function transportError(tcp::Error $e) : Error
+{
+    match ($e) {
+        tcp::Error::timeout => {
+            return .timeout;
+        },
+        else => {
+            return .transport($e);
+        },
+    }
+}

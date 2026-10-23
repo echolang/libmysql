@@ -1,0 +1,201 @@
+/**
+ * Logging in: the proof for each plugin, the server switching plugins on us, and the extra round
+ * trips of caching_sha2_password and sha256_password when the server wants the password itself.
+ * Over a unix socket as it is; over TCP encrypted to the server's RSA key.
+ */
+
+namespace mysql;
+
+use mysql::auth::{native, cachingSha2, xor, publicKey, encrypt, PublicKey};
+
+internal struct Login
+{
+    internal Channel $channel;
+    internal Options $options;
+    internal string $scramble;
+    internal tcp::Deadline $by;
+    internal Plugin $plugin = .cachingSha2;
+
+    /**
+     * The password with its terminating NUL, as the plugins that send it want it.
+     */
+    private const function cleartext() : string
+    {
+        string $p = $this->options->password->clone();
+        $p->push(0);
+        return $p;
+    }
+
+    /**
+     * The first answer for `$plugin`, sent in the handshake response or after a plugin switch.
+     */
+    internal function proof(Plugin $plugin) : result<string, Error>
+    {
+        $this->plugin = $plugin;
+        string $password = $this->options->password;
+        match ($plugin) {
+            Plugin::native => {
+                return .ok(native($password, $this->scramble));
+            },
+            Plugin::cachingSha2 => {
+                return .ok(cachingSha2($password, $this->scramble));
+            },
+            Plugin::sha256 => {
+                if ($password->empty()) {
+                    return .ok("\0");
+                }
+                if ($this->channel->local()) {
+                    return .ok($this->cleartext());
+                }
+                if ($this->options->serverKey != null) {
+                    return $this->sealed();
+                }
+                if ($this->options->fetchServerKey) {
+                    // ask for the key; it comes back as more data
+                    string $ask = '';
+                    $ask->push(1);
+                    return .ok($ask);
+                }
+                return .error(.auth(.needsServerKey));
+            },
+            Plugin::clear => {
+                if (!$this->channel->local()) {
+                    return .error(.auth(.needsSecureTransport));
+                }
+                return .ok($this->cleartext());
+            },
+        }
+    }
+
+    /**
+     * The password encrypted to the configured server key.
+     */
+    private function sealed() : result<string, Error>
+    {
+        string $pem = guard $this->options->serverKey else {
+            return .error(.auth(.needsServerKey));
+        }
+        return $this->seal($pem);
+    }
+
+    /**
+     * The password XOR the scramble, encrypted to the key in `$pem` with RSA-OAEP.
+     */
+    private function seal(const string& $pem) : result<string, Error>
+    {
+        PublicKey $key = guard publicKey($pem) else ($why) {
+            return .error(.auth(.badKey($why)));
+        }
+        string $c = guard encrypt($key, xor($this->cleartext(), $this->scramble)) else ($why) {
+            return .error(.auth(.badKey($why)));
+        }
+        return .ok($c);
+    }
+
+    /**
+     * caching_sha2_password could not use its cache: the server wants the password itself.
+     */
+    private function full() : status<Error>
+    {
+        if ($this->channel->local()) {
+            return $this->channel->write($this->cleartext(), $this->by);
+        }
+        string? $configured = $this->options->serverKey;
+        if ($configured == null) {
+            if (!$this->options->fetchServerKey) {
+                return .error(.auth(.needsServerKey));
+            }
+            string $ask = '';
+            $ask->push(2);
+            guard $this->channel->write($ask, $this->by) else ($e) {
+                return .error($e);
+            }
+            string $reply = guard $this->channel->read($this->by) else ($e) {
+                return .error($e);
+            }
+            if ($reply->empty() || $reply->byte(0) != mysql::protocol::HEADER_MORE) {
+                return .error(.malformed('the server did not send its public key'));
+            }
+            string $sent = guard $this->seal($reply->sub(1, $reply->size() - 1)) else ($e) {
+                return .error($e);
+            }
+            return $this->channel->write($sent, $this->by);
+        }
+        string $sealedPassword = guard $this->sealed() else ($e) {
+            return .error($e);
+        }
+        return $this->channel->write($sealedPassword, $this->by);
+    }
+
+    /**
+     * Read the server's answers until it accepts or refuses the login.
+     */
+    internal function run() : result<Outcome, Error>
+    {
+        while (true) {
+            string $p = guard $this->channel->read($this->by) else ($e) {
+                return .error($e);
+            }
+            if ($p->empty()) {
+                return .error(.malformed('an empty packet during login'));
+            }
+            uint8 $h = $p->byte(0);
+            if ($h == mysql::protocol::HEADER_OK) {
+                return mysql::protocol::ok($p);
+            }
+            if ($h == mysql::protocol::HEADER_ERR) {
+                return .error(mysql::protocol::err($p));
+            }
+            if ($h == mysql::protocol::HEADER_EOF) {
+                // the server switches to another plugin, with a fresh scramble
+                if ($p->size() == 1) {
+                    return .error(.auth(.unsupported('mysql_old_password')));
+                }
+                mysql::protocol::Cursor $c = mysql::protocol::Cursor($p, 1);
+                string $name = $c->nul();
+                string $data = $c->rest();
+                if (!$data->empty() && $data->byte($data->size() - 1) == 0) {
+                    $data = $data->sub(0, $data->size() - 1);
+                }
+                Plugin $next = guard Plugin::named($name) else {
+                    return .error(.auth(.unsupported($name)));
+                }
+                $this->scramble = $data;
+                string $answer = guard $this->proof($next) else ($e) {
+                    return .error($e);
+                }
+                guard $this->channel->write($answer, $this->by) else ($e) {
+                    return .error($e);
+                }
+                continue;
+            }
+            if ($h == mysql::protocol::HEADER_MORE) {
+                string $more = $p->sub(1, $p->size() - 1);
+                if ($this->plugin == Plugin::cachingSha2 && $more->size() == 1) {
+                    if ($more->byte(0) == 3) {
+                        // fast authentication worked; the OK comes next
+                        continue;
+                    }
+                    if ($more->byte(0) == 4) {
+                        guard $this->full() else ($e) {
+                            return .error($e);
+                        }
+                        continue;
+                    }
+                }
+                if ($more->starts('-----BEGIN')) {
+                    // the key we asked for
+                    string $sent = guard $this->seal($more) else ($e) {
+                        return .error($e);
+                    }
+                    guard $this->channel->write($sent, $this->by) else ($e) {
+                        return .error($e);
+                    }
+                    continue;
+                }
+                return .error(.malformed('unexpected data during login'));
+            }
+            return .error(.malformed("packet header {$h} during login"));
+        }
+    }
+}

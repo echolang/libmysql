@@ -1,0 +1,681 @@
+/**
+ * Against a real server. Compiled only with `--define mysql`. `scripts/test-live.sh` starts one
+ * in Docker and sets MYSQL_TEST_URL (an ordinary user, on TCP) and MYSQL_ROOT_URL (root, for the
+ * tests that need to flush the auth cache, create users or kill a connection).
+ */
+
+#[if: mysql]
+
+use std::time;
+
+internal function envUrl(const string& $name) : string
+{
+    string::view $v = guard std::env::var($name) else {
+        die("{$name} is not set");
+    }
+    return string::from($v);
+}
+
+internal function liveOptions(const string& $env) : mysql::Options
+{
+    mysql::Options $o = guard mysql::Options::parse(envUrl($env)) else ($e) {
+        die("url: {$e}");
+    }
+    $o->fetchServerKey = true;
+    return $o;
+}
+
+internal function connect(const mysql::Options& $o) : mysql::Connection
+{
+    mysql::Connection $db = guard mysql::Connection::open($o) else ($e) {
+        die("connect: {$e}");
+    }
+    return $db;
+}
+
+internal function live() : mysql::Connection
+{
+    return connect(liveOptions('MYSQL_TEST_URL'));
+}
+
+internal function root() : mysql::Connection
+{
+    return connect(liveOptions('MYSQL_ROOT_URL'));
+}
+
+internal function run(mysql::Connection $db, const string& $sql) : mysql::Outcome
+{
+    mysql::Outcome $o = guard $db->exec($sql) else ($e) {
+        die("{$sql}: {$e}");
+    }
+    return $o;
+}
+
+/**
+ * MariaDB speaks the same protocol, without caching_sha2_password and with a few other names.
+ */
+internal function mariadb(mysql::Connection $db) : bool
+{
+    return $db->server->contains('MariaDB');
+}
+
+internal function rows(mysql::Connection $db, const string& $sql) : mysql::ResultSet
+{
+    mysql::ResultSet $rs = guard $db->query($sql) else ($e) {
+        die("{$sql}: {$e}");
+    }
+    return $rs;
+}
+
+#[group: 'live']
+test live_connects_and_selects
+{
+    mysql::Connection $db = live();
+    mysql::ResultSet $rs = rows($db, 'SELECT 1 AS one, \'two\' AS two, NULL AS nothing');
+    assert($rs->count() == 1);
+    mysql::Row $row = guard $rs->first();
+    assert(($row['one']->int() ?? 0) == 1);
+    assert(($row['two']->text() ?? '') == 'two');
+    assert($row['nothing']->isNull());
+    if (!mariadb($db)) {
+        assert($db->plugin == mysql::Plugin::cachingSha2);
+    }
+}
+
+#[group: 'live']
+test live_full_auth_needs_the_key_then_the_cache_takes_over
+{
+    // an empty cache forces caching_sha2_password's full authentication
+    mysql::Connection $r = root();
+    if (mariadb($r)) {
+        return;
+    }
+    run($r, 'FLUSH PRIVILEGES');
+
+    mysql::Options $noKey = liveOptions('MYSQL_TEST_URL');
+    $noKey->fetchServerKey = false;
+    result<mysql::Connection, mysql::Error> $refused = mysql::Connection::open($noKey);
+    assert($refused->failed());
+    assert($refused->failure()->name() == 'auth');
+
+    // RSA-OAEP over plain TCP, with the key fetched from the server
+    mysql::Connection $full = live();
+    assert(rows($full, 'SELECT 1')->count() == 1);
+    $full->close();
+
+    // now cached: the fast path needs no key at all
+    mysql::Connection $fast = connect($noKey);
+    assert($fast->alive());
+}
+
+#[group: 'live']
+test live_full_auth_with_a_configured_key
+{
+    mysql::Connection $r = root();
+    if (mariadb($r)) {
+        return;
+    }
+    mysql::ResultSet $key = rows($r, 'SHOW STATUS LIKE \'Caching_sha2_password_rsa_public_key\'');
+    string $pem = guard $key->rows[0]['Value']->text();
+    run($r, 'FLUSH PRIVILEGES');
+
+    mysql::Options $o = liveOptions('MYSQL_TEST_URL');
+    $o->fetchServerKey = false;
+    $o->serverKey = $pem;
+    mysql::Connection $db = connect($o);
+    assert($db->alive());
+}
+
+#[group: 'live']
+test live_native_password_and_a_wrong_password
+{
+    mysql::Options $wrong = liveOptions('MYSQL_TEST_URL');
+    $wrong->password = 'wrong';
+    result<mysql::Connection, mysql::Error> $bad = mysql::Connection::open($wrong);
+    assert($bad->failed());
+    assert($bad->failure()->is(.accessDenied));
+
+    mysql::Connection $r = root();
+    run($r, 'DROP USER IF EXISTS \'legacy\'@\'%\'');
+    result<mysql::Outcome, mysql::Error> $made = $r->exec('CREATE USER \'legacy\'@\'%\' IDENTIFIED WITH mysql_native_password BY \'old-pw\'');
+    if ($made->failed()) {
+        // MySQL 8.4 does not load mysql_native_password by default, and 9 has none (1524)
+        assert($made->failure()->code() != null);
+        return;
+    }
+    run($r, 'GRANT ALL ON shop.* TO \'legacy\'@\'%\'');
+
+    mysql::Options $o = liveOptions('MYSQL_TEST_URL');
+    $o->user = 'legacy';
+    $o->password = 'old-pw';
+    mysql::Connection $db = connect($o);
+    assert($db->plugin == mysql::Plugin::native);
+}
+
+internal function typesTable(mysql::Connection $db) : void
+{
+    run($db, 'DROP TABLE IF EXISTS types');
+    run($db, 'CREATE TABLE types (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        i8 TINYINT, u8 TINYINT UNSIGNED, i16 SMALLINT, i24 MEDIUMINT, i32 INT, u32 INT UNSIGNED,
+        i64 BIGINT, u64 BIGINT UNSIGNED, f32 FLOAT, f64 DOUBLE, amount DECIMAL(20,6),
+        d DATE, dt DATETIME(6), ts TIMESTAMP(3) NULL, t TIME(6), y YEAR,
+        s VARCHAR(100), c CHAR(5), txt TEXT, b BLOB, vb VARBINARY(10), bits BIT(10),
+        e ENUM(\'a\',\'b\'), st SET(\'x\',\'y\'), j JSON
+    ) CHARSET utf8mb4');
+}
+
+internal function checkTypes(const mysql::Row& $r) : void
+{
+    assert(($r['i8']->int() ?? 0) == -128);
+    assert(($r['u8']->uint() ?? 0) == 255);
+    assert(($r['i16']->int() ?? 0) == -32768);
+    assert(($r['i24']->int() ?? 0) == -8388608);
+    assert(($r['i32']->int() ?? 0) == -2147483648);
+    assert(($r['u32']->uint() ?? 0) == 4294967295);
+    assert(($r['i64']->int() ?? 0) == -9223372036854775807);
+    assert(($r['u64']->uint() ?? 0) == 18446744073709551615);
+    assert(($r['f32']->float() ?? 0.0) == 1.5);
+    assert(($r['f64']->float() ?? 0.0) == 2.25);
+    assert(($r['amount']->text() ?? '') == '12345678901234.567890');
+    assert("{$r['d']}" == '2024-02-29');
+    assert("{$r['dt']}" == '2024-02-29 13:05:09.123456');
+    assert("{$r['ts']}" == '2024-02-29 13:05:09.500000');
+    assert("{$r['t']}" == '-838:59:59');
+    assert(($r['y']->int() ?? 0) == 2024);
+    assert(($r['s']->text() ?? '') == 'grüße 😀');
+    assert(($r['c']->text() ?? '') == 'ab');
+    assert(($r['txt']->text() ?? '') == 'long text');
+    string $blob = guard $r['b']->bytes();
+    assert($blob->size() == 3 && $blob->byte(0) == 0 && $blob->byte(2) == 255);
+    assert(($r['vb']->bytes() ?? '') == 'raw');
+    string $bits = guard $r['bits']->bytes();
+    assert($bits->size() == 2);
+    assert(($r['e']->text() ?? '') == 'b');
+    assert(($r['st']->text() ?? '') == 'x,y');
+    string $json = guard $r['j']->text();
+    assert($json->contains('"k"'));
+}
+
+#[group: 'live']
+test live_every_type_through_both_protocols
+{
+    mysql::Connection $db = live();
+    typesTable($db);
+    string $blob = '';
+    $blob->push(0);
+    $blob->push(1);
+    $blob->push(255);
+    mysql::Params $p = [
+        -128, 255, -32768, -8388608, -2147483648, 4294967295 as uint32,
+        -9223372036854775807 as int64, 18446744073709551615 as uint64, 1.5, 2.25,
+        .decimal('12345678901234.567890'),
+        mysql::Date(2024, 2, 29),
+        mysql::DateTime(2024, 2, 29, 13, 5, 9, 123456),
+        mysql::DateTime(2024, 2, 29, 13, 5, 9, 500000),
+        mysql::Time(true, 838, 59, 59, 0),
+        2024, 'grüße 😀', 'ab', 'long text',
+        .bytes($blob), .bytes('raw'), .bytes("\x02\x01"),
+        'b', 'x,y', '{"k": [1, 2]}',
+    ];
+    mysql::Outcome $o = guard $db->exec('INSERT INTO types (i8, u8, i16, i24, i32, u32, i64, u64, f32, f64, amount, d, dt, ts, t, y, s, c, txt, b, vb, bits, e, st, j)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', $p) else ($e) {
+        die("insert: {$e}");
+    }
+    assert($o->affectedRows == 1);
+    assert($o->lastInsertId == 1);
+
+    // the text protocol
+    mysql::ResultSet $text = rows($db, 'SELECT * FROM types');
+    checkTypes($text->rows[0]);
+
+    // the binary protocol
+    mysql::ResultSet $binary = guard $db->query('SELECT * FROM types WHERE id = ?', [1]) else ($e) {
+        die("{$e}");
+    }
+    checkTypes($binary->rows[0]);
+
+    // NULLs both ways
+    run($db, 'INSERT INTO types (i8) VALUES (NULL)');
+    mysql::ResultSet $nulls = guard $db->query('SELECT * FROM types WHERE id = ?', [2]) else ($e) {
+        die("{$e}");
+    }
+    foreach ($nulls->rows[0] as $name => $v) {
+        if ($name != 'id') {
+            assert($v->isNull());
+        }
+    }
+    mysql::ResultSet $nullsText = rows($db, 'SELECT i8, d, j FROM types WHERE id = 2');
+    assert($nullsText->rows[0]['j']->isNull());
+}
+
+#[group: 'live']
+test live_a_blob_bigger_than_one_packet
+{
+    // MariaDB's default is 16 MiB; MySQL's 64 MiB already fits
+    run(root(), 'SET GLOBAL max_allowed_packet = 67108864');
+    mysql::Connection $db = live();
+    run($db, 'DROP TABLE IF EXISTS big');
+    run($db, 'CREATE TABLE big (id INT PRIMARY KEY, data LONGBLOB)');
+    // over 16 MiB: the value crosses the packet split both ways
+    string $data = str::repeat('0123456789abcdef', 1100000);
+    assert($data->size() > 16777215);
+    guard $db->exec('INSERT INTO big VALUES (?, ?)', [1, .bytes($data)]) else ($e) {
+        die("{$e}");
+    }
+    mysql::ResultSet $back = rows($db, 'SELECT data FROM big WHERE id = 1');
+    string $got = guard $back->rows[0]['data']->bytes();
+    assert($got == $data);
+    mysql::ResultSet $prepared = guard $db->query('SELECT data FROM big WHERE id = ?', [1]) else ($e) {
+        die("{$e}");
+    }
+    assert(($prepared->rows[0]['data']->bytes() ?? '') == $data);
+}
+
+#[group: 'live']
+test live_named_placeholders
+{
+    mysql::Connection $db = live();
+    mysql::ResultSet $rs = guard $db->query('SELECT :a + :b AS sum, :a AS again, :name AS name',
+        ['a' => 40, 'b' => 2, 'name' => 'Ada']) else ($e) {
+        die("{$e}");
+    }
+    mysql::Row $r = guard $rs->first();
+    assert(($r['sum']->int() ?? 0) == 42);
+    assert(($r['again']->int() ?? 0) == 40);
+    assert(($r['name']->text() ?? '') == 'Ada');
+
+    result<mysql::ResultSet, mysql::Error> $missing = $db->query('SELECT :a', ['b' => 1]);
+    assert($missing->failed() && $missing->failure()->name() == 'invalid');
+    result<mysql::ResultSet, mysql::Error> $typo = $db->query('SELECT :a', .named(['a' => 1])->set('aa', 2));
+    assert($typo->failed() && $typo->failure()->name() == 'invalid');
+    // the connection is still fine after a refused call
+    assert(rows($db, 'SELECT 1')->count() == 1);
+}
+
+internal function peopleTable(mysql::Connection $db) : void
+{
+    run($db, 'DROP TABLE IF EXISTS people');
+    run($db, 'CREATE TABLE people (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(50) NOT NULL UNIQUE,
+        nick VARCHAR(50) NULL,
+        age INT NOT NULL,
+        avatar BLOB,
+        prefs JSON,
+        balance DECIMAL(12,2),
+        created DATETIME DEFAULT CURRENT_TIMESTAMP
+    ) CHARSET utf8mb4');
+}
+
+internal function graceIsBack(const mysql::ResultSet& $rs, uint64 $id) : void
+{
+    assert($rs->count() == 1);
+    mysql::Row $r = $rs[0];
+    assert(($r['id']->uint() ?? 0) == $id);
+    assert(($r['name']->text() ?? '') == 'Grace');
+    assert($r['nick']->isNull());
+    assert(($r['age']->int() ?? 0) == 85);
+    string $avatar = $r['avatar']->bytes() ?? '';
+    assert($r['avatar']->kind() == 'bytes' && $avatar->size() == 2);
+    string $prefs = $r['prefs']->text() ?? '';
+    assert($prefs->contains('dark'));
+    assert($r['balance']->kind() == 'decimal' && ($r['balance']->text() ?? '') == '1234.50');
+    assert($r['created']->datetime() != null);
+}
+
+#[group: 'live']
+test live_typed_round_trip
+{
+    mysql::Connection $db = live();
+    peopleTable($db);
+
+    string $avatar = "\x00\x01";
+    mysql::Params $grace = [
+        'name'    => 'Grace',
+        'age'     => 85,
+        'avatar'  => .bytes($avatar),
+        'prefs'   => '{"theme": "dark"}',
+        'balance' => .decimal('1234.50'),
+    ];
+    mysql::Outcome $made = guard $db->exec('INSERT INTO people (name, nick, age, avatar, prefs, balance) VALUES (:name, NULL, :age, :avatar, :prefs, :balance)', $grace) else ($e) {
+        die("insert: {$e}");
+    }
+    assert($made->affectedRows == 1);
+    uint64 $id = $made->lastInsertId;
+    assert($id > 0);
+
+    // through a prepared statement (binary rows), then as text (text rows)
+    mysql::ResultSet $bin = guard $db->query('SELECT * FROM people WHERE id = ?', [$id]) else ($e) {
+        die("fetch: {$e}");
+    }
+    mysql::ResultSet $txt = guard $db->query('SELECT * FROM people') else ($e) {
+        die("fetch: {$e}");
+    }
+    graceIsBack($bin, $id);
+    graceIsBack($txt, $id);
+
+    // duplicate key: by MySQL's code and by SQLSTATE
+    result<mysql::Outcome, mysql::Error> $again = $db->exec('INSERT INTO people (name, age) VALUES (?, 1)', ['Grace']);
+    assert($again->failed() && $again->failure()->is(.dupEntry));
+    assert(($again->failure()->state() ?? '') == '23000');
+    assert(!$again->failure()->retryable());
+}
+
+#[group: 'live']
+test live_chunked_insert_built_in_a_loop
+{
+    mysql::Connection $db = live();
+    run($db, 'DROP TABLE IF EXISTS events');
+    run($db, 'CREATE TABLE events (id INT PRIMARY KEY, kind VARCHAR(20))');
+    uint64 $total = 0;
+    int32 $next = 0;
+    while ($next < 10000) {
+        string $sql = 'INSERT INTO events (id, kind) VALUES ';
+        mysql::Params $values = [];
+        int32 $i = 0;
+        while ($i < 500) {
+            if ($i > 0) {
+                $sql->append(', ');
+            }
+            $sql->append('(?, ?)');
+            $values->add([$next, 'click']);
+            $next = $next + 1;
+            $i = $i + 1;
+        }
+        mysql::Outcome $o = guard $db->exec($sql, $values) else ($e) {
+            die("{$e}");
+        }
+        $total = $total + $o->affectedRows;
+    }
+    assert($total == 10000);
+    assert((rows($db, 'SELECT COUNT(*) AS n FROM events')->rows[0]['n']->int() ?? 0) == 10000);
+}
+
+#[group: 'live']
+test live_streams_a_hundred_thousand_rows
+{
+    mysql::Connection $db = live();
+    if (mariadb($db)) {
+        run($db, 'SET SESSION max_recursive_iterations = 200000');
+    } else {
+        run($db, 'SET SESSION cte_max_recursion_depth = 200000');
+    }
+    mysql::Rows $all = guard $db->stream('WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) SELECT i FROM n') else ($e) {
+        die("{$e}");
+    }
+    int64 $sum = 0;
+    int64 $count = 0;
+    foreach ($all as $row) {
+        $sum = $sum + ($row[0]->int() ?? 0);
+        $count = $count + 1;
+    }
+    guard $all->finish() else ($e) {
+        die("{$e}");
+    }
+    assert($count == 100000);
+    assert($sum == 5000050000);
+
+    // busy while a stream is open, free once it is done
+    mysql::Rows $half = guard $db->stream('SELECT 1 UNION ALL SELECT 2') else ($e) {
+        die("{$e}");
+    }
+    result<mysql::ResultSet, mysql::Error> $blocked = $db->query('SELECT 3');
+    assert($blocked->failed() && $blocked->failure()->name() == 'busy');
+    guard $half->finish() else ($e) {
+        die("{$e}");
+    }
+    assert(rows($db, 'SELECT 4')->count() == 1);
+}
+
+internal function sumInPlace(mysql::Rows $rs) : int64
+{
+    usize $at = $rs->columns()->find('i') ?? 99;
+    int64 $sum = 0;
+    while (true) {
+        bool $more = guard $rs->step() else ($e) {
+            die("{$e}");
+        }
+        if (!$more) {
+            break;
+        }
+        $sum = $sum + ($rs->view()->int($at) ?? 0);
+    }
+    guard $rs->finish() else ($e) {
+        die("{$e}");
+    }
+    return $sum;
+}
+
+#[group: 'live']
+test live_streams_read_in_place
+{
+    mysql::Connection $db = live();
+    if (mariadb($db)) {
+        run($db, 'SET SESSION max_recursive_iterations = 200000');
+    } else {
+        run($db, 'SET SESSION cte_max_recursion_depth = 200000');
+    }
+    string $sql = 'WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) SELECT i, CONCAT(\'row \', i) AS label FROM n';
+    // a value makes it a prepared statement: binary rows
+    mysql::Rows $bin = guard $db->stream($sql, [100000]) else ($e) {
+        die("{$e}");
+    }
+    assert(sumInPlace($bin) == 5000050000);
+    // without one, text rows
+    mysql::Rows $txt = guard $db->stream('WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000) SELECT i, CONCAT(\'row \', i) AS label FROM n') else ($e) {
+        die("{$e}");
+    }
+    assert(sumInPlace($txt) == 5000050000);
+    assert(rows($db, 'SELECT 1')->count() == 1);
+}
+
+#[group: 'live']
+test live_multi_results
+{
+    mysql::Options $o = liveOptions('MYSQL_TEST_URL');
+    $o->multiStatements = true;
+    mysql::Connection $db = connect($o);
+    array<mysql::ResultSet> $sets = guard $db->batch('SELECT 1 AS a; SELECT 2 AS b, 3 AS c; DO 1') else ($e) {
+        die("{$e}");
+    }
+    assert($sets->count() == 3);
+    assert(($sets[0]->rows[0]['a']->int() ?? 0) == 1);
+    assert(($sets[1]->rows[0]['c']->int() ?? 0) == 3);
+    assert($sets[2]->count() == 0);
+
+    run($db, 'DROP PROCEDURE IF EXISTS two_results');
+    run($db, 'CREATE PROCEDURE two_results() BEGIN SELECT 10 AS x; SELECT 20 AS y; END');
+    mysql::Rows $r = guard $db->stream('CALL two_results()') else ($e) {
+        die("{$e}");
+    }
+    int64 $first = 0;
+    foreach ($r as $row) {
+        $first = $row['x']->int() ?? 0;
+    }
+    bool $another = guard $r->more() else ($e) {
+        die("{$e}");
+    }
+    assert($another);
+    int64 $second = 0;
+    foreach ($r as $row) {
+        $second = $row['y']->int() ?? 0;
+    }
+    guard $r->finish() else ($e) {
+        die("{$e}");
+    }
+    assert($first == 10 && $second == 20);
+    // a plain query of a procedure keeps the first result and leaves the connection ready
+    mysql::ResultSet $one = rows($db, 'CALL two_results()');
+    assert(($one->rows[0]['x']->int() ?? 0) == 10);
+    assert(rows($db, 'SELECT 1')->count() == 1);
+}
+
+#[group: 'live']
+test live_transactions
+{
+    mysql::Connection $db = live();
+    run($db, 'DROP TABLE IF EXISTS accounts');
+    run($db, 'CREATE TABLE accounts (id INT PRIMARY KEY, balance INT) ENGINE=InnoDB');
+    run($db, 'INSERT INTO accounts VALUES (1, 100), (2, 0)');
+
+    guard $db->transaction(function(mysql::Connection $tx) : status<mysql::Error> {
+        guard $tx->exec('UPDATE accounts SET balance = balance - 30 WHERE id = ?', [1]) else ($e) {
+            return .error($e);
+        }
+        guard $tx->exec('UPDATE accounts SET balance = balance + 30 WHERE id = ?', [2]) else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    }) else ($e) {
+        die("{$e}");
+    }
+    assert(!$db->inTransaction());
+
+    // an error inside rolls everything back
+    status<mysql::Error> $failed = $db->transaction(function(mysql::Connection $tx) : status<mysql::Error> {
+        guard $tx->exec('UPDATE accounts SET balance = 0 WHERE id = 1') else ($e) {
+            return .error($e);
+        }
+        return .error(.invalid('changed my mind'));
+    });
+    assert($failed->failed());
+
+    // a dropped Transaction rolls back too
+    {
+        mysql::Transaction $tx = guard $db->begin() else ($e) {
+            die("{$e}");
+        }
+        assert($db->inTransaction());
+        run($db, 'UPDATE accounts SET balance = 999 WHERE id = 2');
+    }
+    assert(!$db->inTransaction());
+
+    int64 $one = rows($db, 'SELECT balance FROM accounts WHERE id = 1')->rows[0][0]->int() ?? 0;
+    int64 $two = rows($db, 'SELECT balance FROM accounts WHERE id = 2')->rows[0][0]->int() ?? 0;
+    assert($one == 70 && $two == 30);
+
+    // a value back from the transaction
+    result<int64, mysql::Error> $sum = $db->transaction(function(mysql::Connection $tx) : result<int64, mysql::Error> {
+        mysql::ResultSet $rs = guard $tx->query('SELECT CAST(SUM(balance) AS SIGNED) AS s FROM accounts') else ($e) {
+            return .error($e);
+        }
+        int64 $s = guard $rs->rows[0]['s']->int() else {
+            return .error(.invalid('no sum'));
+        }
+        return .ok($s);
+    });
+    assert($sum->or(0) == 100);
+}
+
+#[group: 'live']
+test live_lock_wait_timeout_is_retryable
+{
+    mysql::Connection $a = live();
+    mysql::Connection $b = live();
+    run($a, 'DROP TABLE IF EXISTS locks');
+    run($a, 'CREATE TABLE locks (id INT PRIMARY KEY, v INT) ENGINE=InnoDB');
+    run($a, 'INSERT INTO locks VALUES (1, 0)');
+    run($b, 'SET SESSION innodb_lock_wait_timeout = 1');
+    mysql::Transaction $hold = guard $a->begin() else ($e) {
+        die("{$e}");
+    }
+    run($a, 'UPDATE locks SET v = 1 WHERE id = 1');
+    result<mysql::Outcome, mysql::Error> $waited = $b->exec('UPDATE locks SET v = 2 WHERE id = 1');
+    assert($waited->failed());
+    assert($waited->failure()->is(.lockWaitTimeout));
+    assert($waited->failure()->retryable());
+    guard $hold->rollback() else ($e) {
+        die("{$e}");
+    }
+}
+
+#[group: 'live']
+test live_prepared_statements_run_many_times
+{
+    mysql::Connection $db = live();
+    mysql::Statement $sq = guard $db->prepare('SELECT :n * :n AS square') else ($e) {
+        die("{$e}");
+    }
+    assert($sq->params == 2);
+    assert($sq->names->count() == 2);
+    foreach (1 ..= 5 as $i) {
+        int32 $n = $i;
+        mysql::ResultSet $rs = guard $sq->query(['n' => $n]) else ($e) {
+            die("{$e}");
+        }
+        // the server types `? * ?` as DOUBLE when it prepares the statement
+        assert(($rs->rows[0]['square']->float() ?? 0.0) == ($n * $n) as float64);
+    }
+    $sq->close();
+
+    // a closed Statement leaves the cached statement for the same SQL alone
+    guard $db->query('SELECT ? AS v', [1]) else ($e) {
+        die("{$e}");
+    }
+    mysql::Statement $same = guard $db->prepare('SELECT ? AS v') else ($e) {
+        die("{$e}");
+    }
+    $same->close();
+    mysql::ResultSet $still = guard $db->query('SELECT ? AS v', [2]) else ($e) {
+        die("after close: {$e}");
+    }
+    assert(($still->rows[0]['v']->int() ?? 0) == 2);
+
+    // the statement cache prepares a repeated query once
+    foreach (1 ..= 3 as $i) {
+        int32 $n = $i;
+        mysql::ResultSet $rs = guard $db->query('SELECT ? + 1 AS next', [$n]) else ($e) {
+            die("{$e}");
+        }
+        assert(($rs->rows[0]['next']->float() ?? 0.0) == ($n + 1) as float64);
+    }
+}
+
+#[group: 'live']
+test live_a_deadline_closes_the_connection
+{
+    mysql::Connection $db = live();
+    result<mysql::ResultSet, mysql::Error> $slow = $db->query('SELECT SLEEP(2)', by: tcp::Deadline(ms: 300));
+    assert($slow->failed());
+    assert($slow->failure()->name() == 'timeout');
+    assert(!$db->alive());
+    result<mysql::ResultSet, mysql::Error> $after = $db->query('SELECT 1');
+    assert($after->failed() && $after->failure()->name() == 'closed');
+}
+
+#[group: 'live']
+test live_a_killed_connection_is_noticed
+{
+    mysql::Connection $db = live();
+    mysql::Connection $r = root();
+    run($r, "KILL {$db->id}");
+    result<mysql::ResultSet, mysql::Error> $gone = $db->query('SELECT 1');
+    assert($gone->failed());
+    assert(!$db->alive() || $gone->failure()->name() == 'server');
+    assert($db->ping()->failed());
+}
+
+#[group: 'live']
+test live_session_commands
+{
+    mysql::Connection $db = live();
+    guard $db->ping() else ($e) {
+        die("{$e}");
+    }
+    run($db, 'SET @x = 5');
+    guard $db->reset() else ($e) {
+        die("{$e}");
+    }
+    assert(rows($db, 'SELECT @x AS x')->rows[0]['x']->isNull());
+    guard $db->database('information_schema') else ($e) {
+        die("{$e}");
+    }
+    assert((rows($db, 'SELECT DATABASE() AS d')->rows[0]['d']->text() ?? '') == 'information_schema');
+    result<mysql::Outcome, mysql::Error> $bad = $db->exec('SELEKT 1');
+    assert($bad->failed() && $bad->failure()->is(.parse));
+    $db->close();
+    assert(!$db->alive());
+}
+
+#[end]

@@ -1,0 +1,48 @@
+namespace mysql;
+
+/**
+ * The authentication plugins this client speaks, by the name the server uses for each.
+ */
+public enum Plugin : string
+{
+    /**
+     * `mysql_native_password`: the scramble from the 4.1 handshake.
+     */
+    case native = 'mysql_native_password';
+
+    /**
+     * `caching_sha2_password`: fast auth against the server's cache, full RSA auth when the
+     * cache is empty.
+     */
+    case cachingSha2 = 'caching_sha2_password';
+
+    /**
+     * `sha256_password`: full RSA auth over TCP, cleartext over a unix socket.
+     */
+    case sha256 = 'sha256_password';
+
+    /**
+     * `mysql_clear_password`: the password as it is, unix sockets only.
+     */
+    case clear = 'mysql_clear_password';
+
+    /**
+     * The plugin the server calls `$name`, or null when this client does not speak it.
+     */
+    public static function named(const string& $name) : Plugin?
+    {
+        if ($name == Plugin::cachingSha2->value()) {
+            return Plugin::cachingSha2;
+        }
+        if ($name == Plugin::native->value()) {
+            return Plugin::native;
+        }
+        if ($name == Plugin::sha256->value()) {
+            return Plugin::sha256;
+        }
+        if ($name == Plugin::clear->value()) {
+            return Plugin::clear;
+        }
+        return null;
+    }
+}

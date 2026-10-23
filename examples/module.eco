@@ -1,0 +1,6 @@
+#[module: "libmysql-examples"]
+#[version: "0.1.0"]
+
+#[depends: ".."]
+#[sources: "*.eco"]
+#[target: exe { name: "shop", entry: "shop.eco" }]

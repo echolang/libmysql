@@ -1,0 +1,121 @@
+use mysql::protocol::{placeholders, Placeholders};
+
+internal function rewrite(const string& $sql) : Placeholders
+{
+    Placeholders $p = guard placeholders($sql) else ($e) {
+        die("{$e}");
+    }
+    return $p;
+}
+
+test named_placeholders_become_question_marks
+{
+    Placeholders $p = rewrite('SELECT * FROM t WHERE a = :a AND b > :b_2 OR a = :a');
+    assert($p->sql == 'SELECT * FROM t WHERE a = ? AND b > ? OR a = ?');
+    assert($p->names->count() == 3);
+    assert($p->names[0] == 'a' && $p->names[1] == 'b_2' && $p->names[2] == 'a');
+    assert($p->count == 3);
+}
+
+test plain_placeholders_are_counted
+{
+    Placeholders $p = rewrite('INSERT INTO t VALUES (?, ?), (?, ?)');
+    assert($p->names->empty());
+    assert($p->count == 4);
+    assert($p->sql == 'INSERT INTO t VALUES (?, ?), (?, ?)');
+}
+
+test quotes_and_comments_are_left_alone
+{
+    string $sql = "SELECT ':no', \"?\", `:col`, 'it''s :x', 'a\\'b :y' -- :c ?\n, :real # :d\n/* :e ? */ FROM t";
+    Placeholders $p = rewrite($sql);
+    assert($p->names->count() == 1);
+    assert($p->names[0] == 'real');
+    assert($p->count == 1);
+}
+
+test assignment_and_double_colon_are_not_names
+{
+    Placeholders $p = rewrite('SET @x := :v, @y = 1::int');
+    assert($p->names->count() == 1);
+    assert($p->names[0] == 'v');
+    assert($p->sql == 'SET @x := ?, @y = 1::int');
+}
+
+test hints_are_scanned_as_code
+{
+    Placeholders $p = rewrite('SELECT /*+ MAX_EXECUTION_TIME(:ms) */ 1');
+    assert($p->names->count() == 1);
+}
+
+test mixing_styles_is_invalid
+{
+    assert(placeholders('SELECT ? , :a')->failed());
+}
+
+test a_colon_that_starts_no_name_is_kept
+{
+    Placeholders $p = rewrite("SELECT a:1, b: c, label: BEGIN, x:");
+    assert($p->names->empty() && $p->count == 0);
+    assert($p->sql == "SELECT a:1, b: c, label: BEGIN, x:");
+}
+
+test names_end_at_the_first_character_that_is_not_part_of_one
+{
+    Placeholders $p = rewrite('WHERE a IN (:first,:second) AND b=:_x9-1');
+    assert($p->sql == 'WHERE a IN (?,?) AND b=?-1');
+    assert($p->names[0] == 'first' && $p->names[1] == 'second' && $p->names[2] == '_x9');
+}
+
+test dashes_without_a_space_are_minus_signs
+{
+    Placeholders $p = rewrite("SELECT 1--:a\n");
+    assert($p->names->count() == 1);
+    Placeholders $q = rewrite("SELECT 1 --\t:b\n, :c");
+    assert($q->names->count() == 1 && $q->names[0] == 'c');
+    // a comment at the very end of the SQL
+    Placeholders $end = rewrite('SELECT :a --');
+    assert($end->names->count() == 1 && $end->sql == 'SELECT ? --');
+    Placeholders $hash = rewrite('SELECT :a # :b');
+    assert($hash->names->count() == 1 && $hash->sql == 'SELECT ? # :b');
+}
+
+test unterminated_quotes_and_comments_run_to_the_end
+{
+    Placeholders $q = rewrite("SELECT ':a");
+    assert($q->names->empty() && $q->sql == "SELECT ':a");
+    Placeholders $c = rewrite('SELECT 1 /* :a');
+    assert($c->names->empty() && $c->sql == 'SELECT 1 /* :a');
+    Placeholders $bs = rewrite("SELECT 'a\\");
+    assert($bs->names->empty());
+    // a backslash is no escape inside backticks
+    Placeholders $bt = rewrite('SELECT `a\\` , :x');
+    assert($bt->names->count() == 1);
+    // doubled double quotes stay inside the string
+    Placeholders $dq = rewrite('SELECT "a"":b", :c');
+    assert($dq->names->count() == 1 && $dq->names[0] == 'c');
+}
+
+test executable_comments_are_scanned_and_closed_normally
+{
+    Placeholders $p = rewrite('SELECT /*!50000 :a */ :b');
+    assert($p->names->count() == 2);
+    assert($p->sql == 'SELECT /*!50000 ? */ ?');
+}
+
+test sixty_five_thousand_placeholders_is_the_limit
+{
+    string $ok = str::repeat('?,', 65534);
+    $ok->push(63);
+    assert(rewrite($ok)->count == 65535);
+    string $over = str::repeat('?,', 65535);
+    $over->push(63);
+    result<Placeholders, mysql::Error> $r = placeholders($over);
+    assert($r->failed() && $r->failure()->name() == 'invalid');
+}
+
+test empty_sql_has_no_placeholders
+{
+    Placeholders $p = rewrite('');
+    assert($p->sql == '' && $p->count == 0);
+}

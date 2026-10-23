@@ -1,0 +1,442 @@
+/**
+ * The pool against a scripted server that takes any number of clients, each on a thread of its
+ * own, and answers the few commands a pool sends: logins, pings, transactions, small queries.
+ * What the server saw is counted, so a test can tell a reused connection from a new one.
+ */
+
+use std::thread;
+use std::time;
+use mysql::protocol::{COM_QUERY, COM_PING, COM_QUIT, SERVER_STATUS_IN_TRANS};
+
+internal struct Seen
+{
+    internal usize $logins = 0;
+    internal usize $pings = 0;
+    internal usize $rollbacks = 0;
+    internal usize $quits = 0;
+}
+
+/**
+ * A server for a pool: `$refuse` turns every login after the first that many away, and `$hangUp`
+ * makes the server drop a client on its first ping.
+ */
+internal class Many
+{
+    internal tcp::Listener $l;
+    internal thread::mutex<Seen> $seen;
+    internal usize $refuseAfter;
+    internal bool $hangUp;
+
+    internal constructor(usize $refuseAfter = 1000, bool $hangUp = false)
+    {
+        tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+            die("listen: {$e}");
+        }
+        $this->l = $l;
+        $this->seen = thread::mutex<Seen>(Seen());
+        $this->refuseAfter = $refuseAfter;
+        $this->hangUp = $hangUp;
+    }
+
+    internal function seen() : Seen
+    {
+        thread::locked<Seen> $s = $this->seen->lock();
+        return $s->value;
+    }
+
+    internal const function options() : mysql::Options
+    {
+        mysql::Options $o = mysql::Options($user: 'app', $password: 'secret');
+        $o->port = $this->l->local->port;
+        $o->connectTimeout = time::duration::secs(5);
+        return $o;
+    }
+
+    internal const function pool(mysql::PoolOptions $limits) : mysql::Pool
+    {
+        return mysql::Pool($this->options(), $limits);
+    }
+
+    internal static function start(usize $refuseAfter = 1000, bool $hangUp = false) : Many
+    {
+        Many $m = Many($refuseAfter, $hangUp);
+        thread::handle $h = guard thread::spawn(function() : void {
+            while (true) {
+                tcp::Stream? $got = guard $m->l->accept(tcp::Deadline(ms: 10000)) else ($e) {
+                    return;
+                }
+                tcp::Stream $s = guard $got else {
+                    return;
+                }
+                thread::handle $client = guard thread::spawn(function() : void {
+                    $m->serve(Wire($s));
+                    $s->finish(tcp::Deadline(ms: 1000));
+                }) else ($e) {
+                    die($e->message());
+                }
+                // every client at once, as a real server takes them
+                $client->detach();
+            }
+        }) else ($e) {
+            die($e->message());
+        }
+        $h->detach();
+        return $m;
+    }
+
+    internal function serve(Wire $w) : void
+    {
+        bool $refused = false;
+        {
+            thread::locked<Seen> $s = $this->seen->lock();
+            $s->value->logins = $s->value->logins + 1;
+            $refused = $s->value->logins > $this->refuseAfter;
+        }
+        $w->send(hello('mysql_native_password'));
+        guard $w->tryRecv(10000) else {
+            return;
+        }
+        if ($refused) {
+            $w->send(errPacket(1040, '08004', 'Too many connections'));
+            return;
+        }
+        $w->send(okPacket());
+        uint16 $status = 2;
+        while (true) {
+            string $p = guard $w->tryRecv(10000) else {
+                return;
+            }
+            if ($p->empty()) {
+                return;
+            }
+            uint8 $command = $p->byte(0);
+            if ($command == COM_QUIT) {
+                thread::locked<Seen> $s = $this->seen->lock();
+                $s->value->quits = $s->value->quits + 1;
+                return;
+            }
+            if ($command == COM_PING) {
+                {
+                    thread::locked<Seen> $s = $this->seen->lock();
+                    $s->value->pings = $s->value->pings + 1;
+                }
+                if ($this->hangUp) {
+                    return;
+                }
+                $w->send(okPacket(0, 0, $status));
+                continue;
+            }
+            string $sql = $p->sub(1, $p->size() - 1);
+            if ($sql == 'START TRANSACTION') {
+                $status = 2 | SERVER_STATUS_IN_TRANS;
+            } else if ($sql == 'ROLLBACK' || $sql == 'COMMIT') {
+                if ($sql == 'ROLLBACK') {
+                    thread::locked<Seen> $s = $this->seen->lock();
+                    $s->value->rollbacks = $s->value->rollbacks + 1;
+                }
+                $status = 2;
+            } else if ($sql == 'SELECT n') {
+                $w->sendRows(['1', '2'], $status);
+                continue;
+            }
+            $w->send(okPacket(1, 0, $status));
+        }
+    }
+}
+
+internal function lease(mysql::Pool $p) : mysql::Lease
+{
+    mysql::Lease $l = guard $p->acquire(by: tcp::Deadline(ms: 5000)) else ($e) {
+        die("acquire: {$e}");
+    }
+    return $l;
+}
+
+// a ping only after a long idle, so these tests decide when one is sent
+internal function quiet(usize $max) : mysql::PoolOptions
+{
+    mysql::PoolOptions $o = mysql::PoolOptions($max: $max);
+    $o->pingAfterIdle = time::duration::secs(60);
+    return $o;
+}
+
+test pool_reuses_an_idle_connection
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(2));
+    {
+        mysql::Lease $a = lease($p);
+        assert($p->open() == 1 && $p->idle() == 0);
+        assert(!$a->db()->exec('DO 1')->failed());
+    }
+    assert($p->open() == 1 && $p->idle() == 1);
+    {
+        mysql::Lease $b = lease($p);
+        assert($p->open() == 1 && $p->idle() == 0);
+        $b->release();
+        $b->release();
+    }
+    assert($m->seen()->logins == 1);
+    mysql::ResultSet $rs = guard $p->query('SELECT n') else ($e) {
+        die("{$e}");
+    }
+    assert($rs->count() == 2);
+    assert(!$p->exec('DO 1')->failed());
+    assert($m->seen()->logins == 1);
+}
+
+test pool_runs_out_then_times_out
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    mysql::Lease $held = lease($p);
+    result<mysql::Lease, mysql::Error> $none = $p->acquire(by: tcp::Deadline(ms: 100));
+    assert($none->failed() && $none->failure()->name() == 'exhausted');
+    // the waiter that gave up left no trace: the next one still gets the connection back
+    $held->release();
+    mysql::Lease $again = lease($p);
+    assert($p->open() == 1);
+}
+
+test pool_hands_a_returned_connection_to_the_waiter
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    mysql::Lease $held = lease($p);
+    thread::task<bool> $waiter = guard thread::spawn(function() : bool {
+        result<mysql::Lease, mysql::Error> $l = $p->acquire(by: tcp::Deadline(ms: 5000));
+        return !$l->failed();
+    }) else ($e) {
+        die($e->message());
+    }
+    thread::sleep(100);
+    $held->release();
+    assert($waiter->wait());
+    assert($m->seen()->logins == 1);
+}
+
+test pool_a_lease_dropped_in_a_transaction_is_rolled_back
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    {
+        mysql::Lease $l = lease($p);
+        guard $l->db()->exec('START TRANSACTION') else ($e) {
+            die("{$e}");
+        }
+        assert($l->db()->inTransaction());
+    }
+    assert($m->seen()->rollbacks == 1);
+    assert($p->idle() == 1);
+    mysql::Lease $next = lease($p);
+    assert(!$next->db()->inTransaction());
+}
+
+test pool_transaction_verbs
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    status<mysql::Error> $done = $p->transaction(function(mysql::Connection $c) : status<mysql::Error> {
+        guard $c->exec('UPDATE t') else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    });
+    assert(!$done->failed());
+    result<usize, mysql::Error> $count = $p->transaction<usize>(function(mysql::Connection $c) : result<usize, mysql::Error> {
+        mysql::ResultSet $rs = guard $c->query('SELECT n') else ($e) {
+            return .error($e);
+        }
+        return .ok($rs->count());
+    });
+    assert($count->or(0) == 2);
+    assert($m->seen()->rollbacks == 0);
+}
+
+test pool_a_busy_connection_is_closed_not_kept
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(2));
+    mysql::Rows? $kept = null;
+    {
+        mysql::Lease $l = lease($p);
+        mysql::Rows $rs = guard $l->db()->stream('SELECT n') else ($e) {
+            die("{$e}");
+        }
+        mysql::Rows? $some = $rs;
+        $kept = $some;
+    }
+    // the stream still holds it: the pool let it go and freed the slot
+    assert($p->open() == 0 && $p->idle() == 0);
+}
+
+test pool_keeps_no_more_idle_than_allowed
+{
+    Many $m = Many::start();
+    mysql::PoolOptions $o = quiet(3);
+    $o->maxIdle = 1;
+    mysql::Pool $p = $m->pool($o);
+    {
+        mysql::Lease $a = lease($p);
+        mysql::Lease $b = lease($p);
+        assert($p->open() == 2);
+    }
+    assert($p->open() == 1 && $p->idle() == 1);
+}
+
+test pool_closes_an_idle_connection_past_its_timeout
+{
+    Many $m = Many::start();
+    mysql::PoolOptions $o = quiet(2);
+    $o->idleTimeout = time::duration::millis(50);
+    mysql::Pool $p = $m->pool($o);
+    {
+        mysql::Lease $a = lease($p);
+    }
+    thread::sleep(120);
+    mysql::Lease $b = lease($p);
+    assert($p->open() == 1);
+    assert($m->seen()->logins == 2);
+}
+
+test pool_closes_a_connection_past_its_lifetime
+{
+    Many $m = Many::start();
+    mysql::PoolOptions $o = quiet(2);
+    $o->maxLifetime = time::duration::millis(50);
+    mysql::Pool $p = $m->pool($o);
+    {
+        mysql::Lease $a = lease($p);
+        thread::sleep(120);
+    }
+    assert($p->open() == 0 && $p->idle() == 0);
+}
+
+test pool_pings_a_connection_idle_for_a_while
+{
+    Many $m = Many::start();
+    mysql::PoolOptions $o = mysql::PoolOptions($max: 1);
+    $o->pingAfterIdle = time::duration::millis(20);
+    mysql::Pool $p = $m->pool($o);
+    {
+        mysql::Lease $a = lease($p);
+    }
+    thread::sleep(60);
+    {
+        mysql::Lease $b = lease($p);
+    }
+    assert($m->seen()->pings == 1);
+    assert($m->seen()->logins == 1);
+}
+
+test pool_replaces_a_connection_that_fails_its_ping
+{
+    Many $m = Many::start(1000, true);
+    mysql::PoolOptions $o = mysql::PoolOptions($max: 1);
+    $o->pingAfterIdle = time::duration::millis(20);
+    mysql::Pool $p = $m->pool($o);
+    {
+        mysql::Lease $a = lease($p);
+    }
+    thread::sleep(60);
+    mysql::Lease $b = lease($p);
+    assert($b->db()->alive());
+    assert($p->open() == 1);
+    assert($m->seen()->logins == 2);
+}
+
+test pool_a_failed_login_frees_its_slot
+{
+    Many $m = Many::start(1);
+    mysql::Pool $p = $m->pool(quiet(2));
+    mysql::Lease $a = lease($p);
+    result<mysql::Lease, mysql::Error> $b = $p->acquire(by: tcp::Deadline(ms: 2000));
+    assert($b->failed() && $b->failure()->is(.tooManyConnections));
+    assert($p->open() == 1);
+}
+
+test pool_close_refuses_new_leases_and_closes_returns
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(2));
+    mysql::Lease $lent = lease($p);
+    {
+        mysql::Lease $idle = lease($p);
+    }
+    assert($p->idle() == 1 && $p->open() == 2);
+    $p->close();
+    assert($p->idle() == 0 && $p->open() == 1);
+    assert($p->acquire()->failure()->name() == 'closed');
+    $lent->release();
+    assert($p->open() == 0);
+}
+
+test pool_close_wakes_a_waiter
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    mysql::Lease $held = lease($p);
+    thread::task<string> $waiter = guard thread::spawn(function() : string {
+        result<mysql::Lease, mysql::Error> $l = $p->acquire(by: tcp::Deadline(ms: 5000));
+        if (!$l->failed()) {
+            return 'leased';
+        }
+        return $l->failure()->name();
+    }) else ($e) {
+        die($e->message());
+    }
+    thread::sleep(100);
+    $p->close();
+    assert($waiter->wait() == 'closed');
+}
+
+test pool_a_dead_connection_given_back_frees_its_slot_for_a_waiter
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    mysql::Lease $held = lease($p);
+    thread::task<bool> $waiter = guard thread::spawn(function() : bool {
+        result<mysql::Lease, mysql::Error> $l = $p->acquire(by: tcp::Deadline(ms: 5000));
+        if ($l->failed()) {
+            return false;
+        }
+        return $l->unwrap()->db()->alive();
+    }) else ($e) {
+        die($e->message());
+    }
+    thread::sleep(100);
+    $held->db()->close();
+    $held->release();
+    // the waiter was told a slot opened, and logged in again
+    assert($waiter->wait());
+    assert($m->seen()->logins == 2);
+}
+
+test pool_shared_by_many_threads
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(3));
+    array<thread::task<usize>> $workers = array<thread::task<usize>>();
+    foreach (0 .. 6 as $w) {
+        thread::task<usize> $t = guard thread::spawn(function() : usize {
+            usize $done = 0;
+            foreach (0 .. 20 as $i) {
+                mysql::ResultSet $rs = guard $p->query('SELECT n', by: tcp::Deadline(ms: 5000)) else ($e) {
+                    die("worker: {$e}");
+                }
+                $done = $done + $rs->count();
+            }
+            return $done;
+        }) else ($e) {
+            die($e->message());
+        }
+        $workers->push($t);
+    }
+    usize $total = 0;
+    foreach ($workers as $t) {
+        $total = $total + $t->wait();
+    }
+    assert($total == 240);
+    assert($p->open() <= 3);
+    assert($m->seen()->logins <= 3);
+}

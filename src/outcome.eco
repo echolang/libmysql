@@ -1,0 +1,29 @@
+namespace mysql;
+
+/**
+ * What a statement that returns no rows did: how many rows it touched, the id an AUTO_INCREMENT
+ * column handed out, and the server's warning count and info line.
+ */
+public struct Outcome
+{
+    public const uint64 $affectedRows = 0;
+    public const uint64 $lastInsertId = 0;
+    public const uint16 $warnings = 0;
+    public const string $info = '';
+
+    // the server status bits that came with it
+    internal const uint16 $status = 0;
+
+    /**
+     * True when the server reported an open transaction after this statement.
+     */
+    public const function inTransaction() : bool
+    {
+        return ($this->status & mysql::protocol::SERVER_STATUS_IN_TRANS) != 0;
+    }
+
+    internal const function more() : bool
+    {
+        return ($this->status & mysql::protocol::SERVER_MORE_RESULTS_EXISTS) != 0;
+    }
+}

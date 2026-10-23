@@ -1,0 +1,128 @@
+use std::time;
+
+internal function parsed(const string& $url) : mysql::Options
+{
+    mysql::Options $o = guard mysql::Options::parse($url) else ($e) {
+        die("{$url}: {$e}");
+    }
+    return $o;
+}
+
+test a_full_url
+{
+    mysql::Options $o = parsed('mysql://app:s%40cr%3At@db.example.com:3307/shop%2Dmain?timeout=5s&connectTimeout=250ms&multiStatements=true&statementCache=8');
+    assert($o->user == 'app');
+    assert($o->password == 's@cr:t');
+    assert($o->host == 'db.example.com');
+    assert($o->port == 3307);
+    assert(($o->database ?? '') == 'shop-main');
+    time::duration $t = guard $o->timeout;
+    assert($t == time::duration::secs(5));
+    assert($o->connectTimeout == time::duration::millis(250));
+    assert($o->multiStatements);
+    assert($o->statementCache == 8);
+}
+
+test a_short_url_keeps_the_defaults
+{
+    mysql::Options $o = parsed('mysql://localhost');
+    assert($o->host == 'localhost');
+    assert($o->port == 3306);
+    assert($o->user == 'root');
+    assert($o->database == null);
+    assert($o->timeout == null);
+    assert(!$o->fetchServerKey);
+}
+
+test ipv6_and_a_socket
+{
+    mysql::Options $v6 = parsed('mysql://u@[::1]:3310/db');
+    assert($v6->host == '::1' && $v6->port == 3310);
+    mysql::Options $sock = parsed('mysql://u:p@/db?socket=%2Fvar%2Frun%2Fmysqld.sock');
+    assert(($sock->socket ?? '') == '/var/run/mysqld.sock');
+}
+
+test bad_urls_are_invalid
+{
+    foreach (['postgres://x', 'mysql://h:99999', 'mysql://h?nope=1', 'mysql://h?timeout=soon', 'mysql://u:%zz@h'] as $url) {
+        assert(mysql::Options::parse($url)->failed());
+    }
+}
+
+test options_by_name
+{
+    mysql::Options $o = mysql::Options($user: 'app', $database: 'shop', $port: 3307);
+    assert($o->user == 'app' && $o->port == 3307 && $o->host == '127.0.0.1');
+}
+
+test every_query_option
+{
+    mysql::Options $o = parsed('mysql://h?fetchServerKey=1&multiStatements=0&maxPacket=1024&collation=255&connectTimeout=2m&timeout=7&socket=');
+    assert($o->fetchServerKey);
+    assert(!$o->multiStatements);
+    assert($o->maxPacket == 1024);
+    assert($o->collation == 255);
+    assert($o->connectTimeout == time::duration::mins(2));
+    time::duration $t = guard $o->timeout;
+    assert($t == time::duration::secs(7));
+    assert(($o->socket ?? 'none') == '');
+}
+
+test bad_query_options_are_invalid
+{
+    array<string> $bad = [
+        'mysql://h?collation=256',
+        'mysql://h?maxPacket=big',
+        'mysql://h?multiStatements=yes',
+        'mysql://h?fetchServerKey=',
+        'mysql://h?timeout=-5s',
+        'mysql://h?timeout=ms',
+        'mysql://h?timeout=1.5s',
+        'mysql://h?socket=%2',
+        // a duration that does not fit in milliseconds is refused, not wrapped
+        'mysql://h?timeout=9223372036854775807m',
+        // no packet fits a limit of nothing
+        'mysql://h?maxPacket=0',
+    ];
+    foreach ($bad as $url) {
+        assert(mysql::Options::parse($url)->failed());
+    }
+}
+
+test empty_pairs_are_skipped
+{
+    mysql::Options $o = parsed('mysql://h?&&statementCache=0&');
+    assert($o->statementCache == 0);
+}
+
+test a_password_may_hold_an_at_sign
+{
+    // only the last '@' ends the user info: a password written without escaping still works
+    mysql::Options $o = parsed('mysql://app:p@ss@db:3307/shop');
+    assert($o->user == 'app');
+    assert($o->password == 'p@ss');
+    assert($o->host == 'db' && $o->port == 3307);
+    assert(($o->database ?? '') == 'shop');
+}
+
+test user_without_password_and_host_without_port
+{
+    mysql::Options $o = parsed('mysql://reader@db/');
+    assert($o->user == 'reader' && $o->password == '');
+    assert($o->host == 'db' && $o->port == 3306);
+    assert($o->database == null);
+    mysql::Options $p = parsed('mysql://:only@db');
+    assert($p->user == '' && $p->password == 'only');
+}
+
+test ipv6_urls_that_do_not_parse
+{
+    assert(mysql::Options::parse('mysql://[::1')->failed());
+    assert(mysql::Options::parse('mysql://[::1]x')->failed());
+    assert(mysql::Options::parse('mysql://[::1]:0')->failed());
+    mysql::Options $o = parsed('mysql://[fe80::1]');
+    assert($o->host == 'fe80::1' && $o->port == 3306);
+    assert(mysql::Options::parse('mysql://h:')->failed());
+    assert(mysql::Options::parse('mysql://u%ZZ@h')->failed());
+    assert(mysql::Options::parse('mysql://h/db%')->failed());
+}

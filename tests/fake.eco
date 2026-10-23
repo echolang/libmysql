@@ -1,0 +1,430 @@
+/**
+ * A scripted MySQL server for the session tests: listens, accepts one client on a thread of its
+ * own, and plays whatever the test's script says, packet by packet. No real server needed.
+ */
+
+use std::thread;
+use mysql::protocol::{putLenenc, putLenString, putNul};
+
+/**
+ * The server's side of one connection: packets with sequence numbers, as the protocol has them.
+ */
+internal class Wire
+{
+    internal tcp::Stream $s;
+    internal tcp::Reader $r;
+    internal uint8 $seq;
+
+    internal constructor(tcp::Stream $s)
+    {
+        $this->s = $s;
+        $this->r = tcp::Reader(max: 16777215);
+        $this->seq = 0;
+    }
+
+    internal function send(const string& $payload) : void
+    {
+        string $head = '';
+        tcp::wire::putLe24($head, $payload->size() as uint32);
+        $head->push($this->seq);
+        $this->seq = $this->seq + 1;
+        guard $this->s->write($head, $payload, tcp::Deadline(ms: 5000)) else ($e) {
+            die("fake send: {$e}");
+        }
+    }
+
+    /**
+     * The next packet from the client; a new command (sequence 0) restarts the count.
+     */
+    internal function recv() : string
+    {
+        string $p = guard $this->tryRecv(5000) else {
+            die('fake recv: the client went away');
+        }
+        return $p;
+    }
+
+    /**
+     * The next packet, or null once the client has gone or `$ms` have passed.
+     */
+    internal function tryRecv(int64 $ms) : string?
+    {
+        string? $h = guard $this->r->exactly($this->s, 4, tcp::Deadline(ms: $ms)) else ($e) {
+            return null;
+        }
+        string $head = guard $h else {
+            return null;
+        }
+        usize $len = tcp::wire::le24($head, 0) as usize;
+        $this->seq = $head->byte(3) + 1;
+        if ($len == 0) {
+            string? $empty = '';
+            return $empty;
+        }
+        string? $b = guard $this->r->exactly($this->s, $len, tcp::Deadline(ms: $ms)) else ($e) {
+            return null;
+        }
+        return $b;
+    }
+
+    /**
+     * Send a packet with a sequence number of the test's choosing.
+     */
+    internal function sendAs(uint8 $seq, const string& $payload) : void
+    {
+        $this->seq = $seq;
+        $this->send($payload);
+    }
+
+    /**
+     * Greet with `$plugin` as the default and take the client's answer.
+     */
+    internal function greet(const string& $plugin) : Answer
+    {
+        $this->send(hello($plugin));
+        return answer($this->recv());
+    }
+
+    /**
+     * Greet, take the client's answer, and let it in with native password.
+     */
+    internal function welcome() : void
+    {
+        $this->greet('mysql_native_password');
+        $this->send(okPacket());
+    }
+
+    /**
+     * The command the client sends next: its first byte must be `$command`, and the rest comes back.
+     */
+    internal function expect(uint8 $command) : string
+    {
+        string $p = $this->recv();
+        if ($p->empty() || $p->byte(0) != $command) {
+            die("fake: expected command {$command}");
+        }
+        return $p->sub(1, $p->size() - 1);
+    }
+
+    /**
+     * A small result: one column `n`, the rows given, then the end.
+     */
+    internal function sendRows(const array<string>& $values, uint16 $status = 2) : void
+    {
+        $this->send(countPacket(1));
+        $this->send(columnDef('n', 3));
+        foreach ($values as $v) {
+            array<string> $cells = [$v];
+            $this->send(textRowOf($cells));
+        }
+        $this->send(okEnd($status));
+    }
+
+    /**
+     * Send a payload of any size, split into packets the way the protocol does.
+     */
+    internal function sendLong(const string& $payload) : void
+    {
+        usize $at = 0;
+        while (true) {
+            usize $len = $payload->size() - $at;
+            if ($len > 16777215) {
+                $len = 16777215;
+            }
+            $this->send($payload->sub($at, $len));
+            $at = $at + $len;
+            if ($len < 16777215) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * The next payload from the client, joined from as many packets as it took.
+     */
+    internal function recvLong() : string
+    {
+        string $out = $this->recv();
+        if ($out->size() < 16777215) {
+            return $out;
+        }
+        while (true) {
+            string $p = $this->recv();
+            $out->append($p);
+            if ($p->size() < 16777215) {
+                return $out;
+            }
+        }
+    }
+}
+
+internal function scramble() : string
+{
+    string $s = '';
+    foreach (1 ..= 20 as $i) {
+        $s->push(byteOf($i));
+    }
+    return $s;
+}
+
+// what a MySQL 8 server offers
+internal const uint32 SERVER_CAPS = 4294967295;
+
+/**
+ * HandshakeV10 with the test scramble (1..20), the given default plugin and capabilities.
+ */
+internal function hello(const string& $plugin, uint32 $caps = SERVER_CAPS) : string
+{
+    string $p = '';
+    $p->push(10);
+    putNul($p, '8.0.99-fake');
+    tcp::wire::putLe32($p, 77);
+    string $sc = scramble();
+    $p->append($sc->sub(0, 8));
+    $p->push(0);
+    tcp::wire::putLe16($p, ($caps & 65535) as uint16);
+    $p->push(45);
+    tcp::wire::putLe16($p, 2);
+    tcp::wire::putLe16($p, ($caps >> 16) as uint16);
+    $p->push(21);
+    $p->append(str::repeat("\0", 10));
+    $p->append($sc->sub(8, 12));
+    $p->push(0);
+    putNul($p, $plugin);
+    return $p;
+}
+
+internal function okPacket(uint64 $affected = 0, uint64 $id = 0, uint16 $status = 2) : string
+{
+    string $p = '';
+    $p->push(0);
+    putLenenc($p, $affected);
+    putLenenc($p, $id);
+    tcp::wire::putLe16($p, $status);
+    tcp::wire::putLe16($p, 0);
+    return $p;
+}
+
+/**
+ * The OK that ends a result set under DEPRECATE_EOF (header 0xFE).
+ */
+internal function okEnd(uint16 $status = 2) : string
+{
+    string $p = okPacket(0, 0, $status);
+    string $out = '';
+    $out->push(254);
+    $out->append($p->sub(1, $p->size() - 1));
+    return $out;
+}
+
+internal function eofPacket(uint16 $status = 2) : string
+{
+    string $p = '';
+    $p->push(254);
+    tcp::wire::putLe16($p, 0);
+    tcp::wire::putLe16($p, $status);
+    return $p;
+}
+
+internal function errPacket(uint16 $code, const string& $state, const string& $message) : string
+{
+    string $p = '';
+    $p->push(255);
+    tcp::wire::putLe16($p, $code);
+    $p->push(35);
+    $p->append($state);
+    $p->append($message);
+    return $p;
+}
+
+internal function more(const string& $data) : string
+{
+    string $p = '';
+    $p->push(1);
+    $p->append($data);
+    return $p;
+}
+
+/**
+ * caching_sha2_password's "perform full authentication".
+ */
+internal function fullAuth() : string
+{
+    string $four = '';
+    $four->push(4);
+    return more($four);
+}
+
+/**
+ * An auth switch to `$plugin`, with `$data` as its scramble.
+ */
+internal function switchTo(const string& $plugin, const string& $data = '') : string
+{
+    string $p = '';
+    $p->push(254);
+    putNul($p, $plugin);
+    $p->append($data);
+    return $p;
+}
+
+/**
+ * A LOCAL INFILE request for `$name`.
+ */
+internal function fileRequest(const string& $name) : string
+{
+    string $p = '';
+    $p->push(251);
+    $p->append($name);
+    return $p;
+}
+
+internal function columnDef(const string& $name, uint8 $type, uint16 $flags = 0, uint16 $charset = 45) : string
+{
+    string $p = '';
+    putLenString($p, 'def');
+    putLenString($p, 'shop');
+    putLenString($p, 't');
+    putLenString($p, 't');
+    putLenString($p, $name);
+    putLenString($p, $name);
+    putLenenc($p, 12);
+    tcp::wire::putLe16($p, $charset);
+    tcp::wire::putLe32($p, 255);
+    $p->push($type);
+    tcp::wire::putLe16($p, $flags);
+    $p->push(0);
+    $p->push(0);
+    $p->push(0);
+    return $p;
+}
+
+internal function textRowOf(const array<string>& $cells) : string
+{
+    string $p = '';
+    foreach ($cells as $c) {
+        if ($c == '<NULL>') {
+            $p->push(251);
+        } else {
+            putLenString($p, $c);
+        }
+    }
+    return $p;
+}
+
+/**
+ * What the client said in its HandshakeResponse41.
+ */
+internal struct Answer
+{
+    internal uint32 $caps;
+    internal string $user;
+    internal string $auth;
+    internal string $database;
+    internal string $plugin;
+}
+
+internal function answer(const string& $p) : Answer
+{
+    mysql::protocol::Cursor $c = mysql::protocol::Cursor($p);
+    uint32 $caps = $c->u32()->or(0);
+    $c->at = $c->at + 4 + 1 + 23;
+    string $user = $c->nul();
+    string $auth = $c->string()->or('');
+    string $db = '';
+    if (($caps & mysql::protocol::CLIENT_CONNECT_WITH_DB) != 0) {
+        $db = $c->nul();
+    }
+    string $plugin = $c->nul();
+    return Answer($caps, $user, $auth, $db, $plugin);
+}
+
+/**
+ * A listener and the thread serving its first client with `$script`.
+ */
+internal struct Fake
+{
+    internal tcp::Address $at;
+    internal thread::handle $server;
+}
+
+internal function fake(function<void(Wire)> $script) : Fake
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+        die("listen: {$e}");
+    }
+    return serveOn($l, $script);
+}
+
+internal function fakeUnix(const string& $path, function<void(Wire)> $script) : Fake
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(unix: $path)) else ($e) {
+        die("listen: {$e}");
+    }
+    return serveOn($l, $script);
+}
+
+internal function serveOn(tcp::Listener $l, function<void(Wire)> $script) : Fake
+{
+    thread::handle $h = guard thread::spawn(function() : void {
+        tcp::Stream? $maybe = guard $l->accept(tcp::Deadline(ms: 5000)) else ($e) {
+            die("accept: {$e}");
+        }
+        tcp::Stream $s = guard $maybe else {
+            die('no client came');
+        }
+        $script(Wire($s));
+        $s->finish(tcp::Deadline(ms: 1000));
+        $l->close();
+    }) else ($e) {
+        die($e->message());
+    }
+    return Fake($l->local, $h);
+}
+
+internal function optionsFor(const Fake& $f) : mysql::Options
+{
+    mysql::Options $o = mysql::Options($user: 'app', $password: 'secret', $database: 'shop');
+    $o->host = '127.0.0.1';
+    $o->port = $f->at->port;
+    $o->connectTimeout = std::time::duration::secs(5);
+    return $o;
+}
+
+internal function login(const mysql::Options& $o) : mysql::Connection
+{
+    mysql::Connection $db = guard mysql::Connection::open($o) else ($e) {
+        die("connect: {$e}");
+    }
+    return $db;
+}
+
+internal function login(const Fake& $f) : mysql::Connection
+{
+    return login(optionsFor($f));
+}
+
+/**
+ * The OK that answers COM_STMT_PREPARE: statement `$id` with `$columns` columns and `$params`
+ * placeholders. Their definitions follow it.
+ */
+internal function prepareOk(uint32 $id, uint16 $columns, uint16 $params) : string
+{
+    string $ok = '';
+    $ok->push(0);
+    tcp::wire::putLe32($ok, $id);
+    tcp::wire::putLe16($ok, $columns);
+    tcp::wire::putLe16($ok, $params);
+    $ok->push(0);
+    tcp::wire::putLe16($ok, 0);
+    return $ok;
+}
+
+/**
+ * A column count packet, the first packet of a result set.
+ */
+internal function countPacket(uint64 $n) : string
+{
+    string $p = '';
+    putLenenc($p, $n);
+    return $p;
+}

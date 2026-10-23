@@ -1,0 +1,976 @@
+/**
+ * More whole conversations against the scripted server: session commands, transactions, prepared
+ * statements and their cache, multi-results, streams and the busy rule, payloads past one packet,
+ * deadlines, and the login paths a real server rarely takes.
+ */
+
+use mysql::protocol::{COM_QUERY, COM_PING, COM_INIT_DB, COM_RESET_CONNECTION, COM_STMT_PREPARE, COM_STMT_EXECUTE, COM_STMT_CLOSE, COM_QUIT, SERVER_MORE_RESULTS_EXISTS, SERVER_STATUS_IN_TRANS};
+use std::time;
+
+test session_ping_reset_and_database
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        assert($w->expect(COM_PING)->empty());
+        $w->send(okPacket());
+        assert($w->expect(COM_INIT_DB) == 'other');
+        $w->send(okPacket());
+        assert($w->expect(COM_INIT_DB) == 'nope');
+        $w->send(errPacket(1049, '42000', 'Unknown database \'nope\''));
+        assert($w->expect(COM_RESET_CONNECTION)->empty());
+        $w->send(okPacket());
+        $w->expect(COM_QUIT);
+    });
+    mysql::Connection $db = login($f);
+    guard $db->ping() else ($e) {
+        die("ping: {$e}");
+    }
+    guard $db->database('other') else ($e) {
+        die("database: {$e}");
+    }
+    status<mysql::Error> $bad = $db->database('nope');
+    assert($bad->failed() && $bad->failure()->is(.badDatabase));
+    guard $db->reset() else ($e) {
+        die("reset: {$e}");
+    }
+    $db->close();
+    assert(!$db->alive());
+    // twice is fine, and a closed connection says so
+    $db->close();
+    assert($db->ping()->failure()->name() == 'closed');
+    assert($db->query('SELECT 1')->failure()->name() == 'closed');
+}
+
+test session_a_transaction_commits_and_a_dropped_one_rolls_back
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        assert($w->expect(COM_QUERY) == 'START TRANSACTION');
+        $w->send(okPacket(0, 0, SERVER_STATUS_IN_TRANS));
+        assert($w->expect(COM_QUERY) == 'INSERT 1');
+        $w->send(okPacket(1, 5, SERVER_STATUS_IN_TRANS));
+        assert($w->expect(COM_QUERY) == 'COMMIT');
+        $w->send(okPacket());
+
+        assert($w->expect(COM_QUERY) == 'START TRANSACTION');
+        $w->send(okPacket(0, 0, SERVER_STATUS_IN_TRANS));
+        assert($w->expect(COM_QUERY) == 'ROLLBACK');
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    {
+        mysql::Transaction $tx = guard $db->begin() else ($e) {
+            die("begin: {$e}");
+        }
+        assert($tx->open() && $db->inTransaction());
+        mysql::Outcome $o = guard $db->exec('INSERT 1') else ($e) {
+            die("{$e}");
+        }
+        assert($o->inTransaction() && $o->lastInsertId == 5);
+        guard $tx->commit() else ($e) {
+            die("commit: {$e}");
+        }
+        assert(!$tx->open() && !$db->inTransaction());
+        assert($tx->commit()->failure()->name() == 'invalid');
+        assert(!$tx->rollback()->failed());
+    }
+    {
+        mysql::Transaction $dropped = guard $db->begin() else ($e) {
+            die("begin: {$e}");
+        }
+    }
+    assert(!$db->inTransaction());
+}
+
+test session_transaction_work_that_fails_is_rolled_back
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        assert($w->expect(COM_QUERY) == 'START TRANSACTION');
+        $w->send(okPacket(0, 0, SERVER_STATUS_IN_TRANS));
+        assert($w->expect(COM_QUERY) == 'UPDATE a');
+        $w->send(errPacket(1213, '40001', 'Deadlock found'));
+        assert($w->expect(COM_QUERY) == 'ROLLBACK');
+        $w->send(okPacket());
+
+        assert($w->expect(COM_QUERY) == 'START TRANSACTION');
+        $w->send(okPacket(0, 0, SERVER_STATUS_IN_TRANS));
+        assert($w->expect(COM_QUERY) == 'SELECT n');
+        $w->sendRows(['41'], SERVER_STATUS_IN_TRANS);
+        assert($w->expect(COM_QUERY) == 'COMMIT');
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    status<mysql::Error> $failed = $db->transaction(function(mysql::Connection $c) : status<mysql::Error> {
+        guard $c->exec('UPDATE a') else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    });
+    assert($failed->failed() && $failed->failure()->retryable());
+    assert(!$db->inTransaction());
+
+    result<int64, mysql::Error> $answer = $db->transaction<int64>(function(mysql::Connection $c) : result<int64, mysql::Error> {
+        mysql::ResultSet $rs = guard $c->query('SELECT n') else ($e) {
+            return .error($e);
+        }
+        return .ok(($rs[0]['n']->int() ?? 0) + 1);
+    });
+    assert($answer->or(0) == 42);
+}
+
+test session_a_prepared_statement_runs_and_closes
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        assert($w->expect(COM_STMT_PREPARE) == 'SELECT n FROM t WHERE id = ?');
+        $w->send(prepareOk(3, 1, 1));
+        $w->send(columnDef('?', 8));
+        $w->send(columnDef('n', 3));
+
+        // two runs: the first answers a row in the binary protocol, the second an error
+        string $run = $w->expect(COM_STMT_EXECUTE);
+        assert(tcp::wire::le32($run, 0) == 3);
+        $w->send(countPacket(1));
+        $w->send(columnDef('n', 3));
+        string $row = '';
+        $row->push(0);
+        $row->push(0);
+        tcp::wire::putLe32($row, 99);
+        $w->send($row);
+        $w->send(okEnd());
+
+        $w->expect(COM_STMT_EXECUTE);
+        $w->send(errPacket(1146, '42S02', 'Table \'shop.t\' doesn\'t exist'));
+
+        string $close = $w->expect(COM_STMT_CLOSE);
+        assert(tcp::wire::le32($close, 0) == 3);
+        $w->expect(COM_QUIT);
+    });
+    mysql::Connection $db = login($f);
+    mysql::Statement $st = guard $db->prepare('SELECT n FROM t WHERE id = ?') else ($e) {
+        die("prepare: {$e}");
+    }
+    assert($st->params == 1 && $st->names->empty());
+    assert($st->columns()->count() == 1 && $st->columns()->at(0)->name == 'n');
+    mysql::ResultSet $rs = guard $st->query([1]) else ($e) {
+        die("run: {$e}");
+    }
+    assert(($rs[0]['n']->int() ?? 0) == 99);
+    result<mysql::ResultSet, mysql::Error> $gone = $st->query([2]);
+    assert($gone->failed() && $gone->failure()->is(.noSuchTable));
+    assert($db->alive());
+    // the wrong number of values never reaches the server
+    assert($st->exec()->failure()->name() == 'invalid');
+    $st->close();
+    $st->close();
+    assert($st->exec([1])->failure()->name() == 'invalid');
+    $db->close();
+}
+
+test session_named_placeholders_on_a_statement
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        assert($w->expect(COM_STMT_PREPARE) == 'UPDATE t SET a = ? WHERE b = ?');
+        $w->send(prepareOk(4, 0, 2));
+        $w->send(columnDef('?', 8));
+        $w->send(columnDef('?', 8));
+        string $run = $w->expect(COM_STMT_EXECUTE);
+        // a = 10, b = 20, in the SQL's order
+        assert(tcp::wire::le64($run, 15) == 10 && tcp::wire::le64($run, 23) == 20);
+        $w->send(okPacket(2));
+        $w->expect(COM_STMT_CLOSE);
+    });
+    mysql::Connection $db = login($f);
+    mysql::Statement $st = guard $db->prepare('UPDATE t SET a = :a WHERE b = :b') else ($e) {
+        die("prepare: {$e}");
+    }
+    assert($st->names->count() == 2 && $st->names[1] == 'b');
+    mysql::Outcome $o = guard $st->exec(['b' => 20, 'a' => 10]) else ($e) {
+        die("run: {$e}");
+    }
+    assert($o->affectedRows == 2);
+}
+
+test session_the_statement_cache_reuses_and_evicts
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        // the first SQL is prepared once and run twice
+        assert($w->expect(COM_STMT_PREPARE) == 'DO ?');
+        $w->send(prepareOk(1, 0, 1));
+        $w->send(columnDef('?', 8));
+        $w->expect(COM_STMT_EXECUTE);
+        $w->send(okPacket());
+        string $again = $w->expect(COM_STMT_EXECUTE);
+        assert(tcp::wire::le32($again, 0) == 1);
+        $w->send(okPacket());
+        // a second SQL with a cache of one: the first statement is closed before it is prepared
+        string $evicted = $w->expect(COM_STMT_CLOSE);
+        assert(tcp::wire::le32($evicted, 0) == 1);
+        assert($w->expect(COM_STMT_PREPARE) == 'DO ? + 1');
+        $w->send(prepareOk(2, 0, 1));
+        $w->send(columnDef('?', 8));
+        $w->expect(COM_STMT_EXECUTE);
+        $w->send(okPacket());
+        // a reset forgets the cache: the server dropped every statement
+        $w->expect(COM_RESET_CONNECTION);
+        $w->send(okPacket());
+        assert($w->expect(COM_STMT_PREPARE) == 'DO ? + 1');
+        $w->send(prepareOk(3, 0, 1));
+        $w->send(columnDef('?', 8));
+        string $fresh = $w->expect(COM_STMT_EXECUTE);
+        assert(tcp::wire::le32($fresh, 0) == 3);
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->statementCache = 1;
+    mysql::Connection $db = login($o);
+    guard $db->exec('DO ?', [1]) else ($e) {
+        die("{$e}");
+    }
+    guard $db->exec('DO ?', [2]) else ($e) {
+        die("{$e}");
+    }
+    guard $db->exec('DO ? + 1', [3]) else ($e) {
+        die("{$e}");
+    }
+    guard $db->reset() else ($e) {
+        die("{$e}");
+    }
+    guard $db->exec('DO ? + 1', [4]) else ($e) {
+        die("{$e}");
+    }
+}
+
+test session_without_a_cache_every_run_prepares
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        foreach (1 ..= 2 as $i) {
+            assert($w->expect(COM_STMT_PREPARE) == 'DO ?');
+            $w->send(prepareOk(byteOf($i) as uint32, 0, 1));
+            $w->send(columnDef('?', 8));
+            $w->expect(COM_STMT_EXECUTE);
+            $w->send(okPacket());
+        }
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->statementCache = 0;
+    mysql::Connection $db = login($o);
+    assert(!$db->exec('DO ?', [1])->failed());
+    assert(!$db->exec('DO ?', [1])->failed());
+}
+
+test session_empty_params_send_plain_text_but_still_check
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        assert($w->expect(COM_QUERY) == 'DO 1');
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    mysql::Params $none = [];
+    assert(!$db->exec('DO 1', $none)->failed());
+    mysql::Params $named = [];
+    $named['x'] = 1;
+    $named->clear();
+    assert($named->count() == 0);
+}
+
+test session_a_prepare_the_server_refuses_keeps_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_STMT_PREPARE);
+        $w->send(errPacket(1064, '42000', 'You have an error in your SQL syntax'));
+        $w->expect(COM_QUERY);
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Statement, mysql::Error> $r = $db->prepare('SELEC ?');
+    assert($r->failed() && $r->failure()->is(.parse));
+    assert(!$db->exec('DO 1')->failed());
+}
+
+test session_a_prepare_answer_that_does_not_parse_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_STMT_PREPARE);
+        $w->send(prepareOk(1, 1, 1));
+        // a broken parameter definition; the column definition is still on its way
+        $w->send('xx');
+        $w->send(columnDef('n', 3));
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Statement, mysql::Error> $r = $db->prepare('SELECT ?');
+    assert($r->failed() && $r->failure()->name() == 'malformed');
+    // what is left on the wire must never be read as the next answer
+    assert(!$db->alive());
+}
+
+test session_a_prepare_that_counts_other_names_frees_the_statement
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_STMT_PREPARE);
+        // the SQL names two placeholders; this server counts one
+        $w->send(prepareOk(6, 0, 1));
+        $w->send(columnDef('?', 8));
+        string $close = $w->expect(COM_STMT_CLOSE);
+        assert(tcp::wire::le32($close, 0) == 6);
+        $w->expect(COM_QUERY);
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Statement, mysql::Error> $r = $db->prepare('SELECT :a, :b');
+    assert($r->failed() && $r->failure()->name() == 'invalid');
+    assert(!$db->exec('DO 1')->failed());
+}
+
+test session_a_column_count_no_result_could_have_is_malformed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        // an 8 byte column count: not a number of columns any server sends
+        $w->send(countPacket(1152921504606846976));
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::ResultSet, mysql::Error> $r = $db->query('SELECT 1');
+    assert($r->failed() && $r->failure()->name() == 'malformed');
+    assert(!$db->alive());
+}
+
+test session_a_server_error_after_some_rows_keeps_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->send(countPacket(1));
+        $w->send(columnDef('n', 3));
+        $w->send(textRowOf(['1']));
+        $w->send(errPacket(1317, '70100', 'Query execution was interrupted'));
+        $w->expect(COM_QUERY);
+        $w->sendRows(['2']);
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::ResultSet, mysql::Error> $r = $db->query('SELECT n');
+    assert($r->failed() && $r->failure()->is(.queryInterrupted));
+    assert($db->alive());
+    mysql::ResultSet $rs = guard $db->query('SELECT n') else ($e) {
+        die("{$e}");
+    }
+    assert(($rs[0]['n']->int() ?? 0) == 2);
+}
+
+test session_a_stream_keeps_the_connection_busy_until_it_ends
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->sendRows(['1', '2', '3']);
+        $w->expect(COM_QUERY);
+        $w->sendRows(['4', '5']);
+        $w->expect(COM_QUERY);
+        $w->send(okPacket(7));
+    });
+    mysql::Connection $db = login($f);
+    {
+        mysql::Rows $rs = guard $db->stream('SELECT n') else ($e) {
+            die("{$e}");
+        }
+        assert($rs->columns()->count() == 1);
+        assert($db->query('SELECT 2')->failure()->name() == 'busy');
+        assert($db->ping()->failure()->name() == 'busy');
+        mysql::Row? $first = guard $rs->next() else ($e) {
+            die("{$e}");
+        }
+        assert($first != null);
+        // finishing drops the rest unread
+        guard $rs->finish() else ($e) {
+            die("{$e}");
+        }
+        assert($rs->next()->or(null) == null);
+        bool $stepped = guard $rs->step() else ($e) {
+            die("{$e}");
+        }
+        assert(!$stepped);
+    }
+    {
+        // dropping a stream frees the connection too
+        mysql::Rows $dropped = guard $db->stream('SELECT n') else ($e) {
+            die("{$e}");
+        }
+    }
+    mysql::Rows $none = guard $db->stream('DELETE FROM t') else ($e) {
+        die("{$e}");
+    }
+    assert($none->columns()->count() == 0);
+    assert($none->next()->or(null) == null);
+    assert($none->outcome()->affectedRows == 7);
+}
+
+test session_a_stream_walked_by_foreach
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->sendRows(['1', '2', '3']);
+        $w->expect(COM_QUERY);
+        $w->send(countPacket(1));
+        $w->send(columnDef('n', 3));
+        $w->send(textRowOf(['1']));
+        $w->send(errPacket(1317, '70100', 'Query execution was interrupted'));
+    });
+    mysql::Connection $db = login($f);
+    mysql::Rows $rs = guard $db->stream('SELECT n') else ($e) {
+        die("{$e}");
+    }
+    int64 $sum = 0;
+    foreach ($rs as $row) {
+        $sum = $sum + ($row['n']->int() ?? 0);
+    }
+    assert($sum == 6);
+    assert(!$rs->finish()->failed());
+
+    // an error ends the loop, and finish() reports it
+    mysql::Rows $broken = guard $db->stream('SELECT n') else ($e) {
+        die("{$e}");
+    }
+    usize $seen = 0;
+    foreach ($broken as $row) {
+        $seen = $seen + 1;
+    }
+    assert($seen == 1);
+    status<mysql::Error> $why = $broken->finish();
+    assert($why->failed() && $why->failure()->is(.queryInterrupted));
+    assert($db->alive());
+}
+
+test session_multi_results_through_a_stream
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        // a result, an OK with no rows, another result, then the last OK
+        $w->sendRows(['1', '2'], SERVER_MORE_RESULTS_EXISTS);
+        $w->send(okPacket(3, 0, SERVER_MORE_RESULTS_EXISTS));
+        $w->sendRows(['9'], SERVER_MORE_RESULTS_EXISTS);
+        $w->send(okPacket(0, 0, 2));
+        $w->expect(COM_QUERY);
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    mysql::Rows $rs = guard $db->stream('CALL p()') else ($e) {
+        die("{$e}");
+    }
+    // leave the first result half read
+    assert($rs->next()->or(null) != null);
+    bool $more = guard $rs->more() else ($e) {
+        die("{$e}");
+    }
+    assert($more);
+    assert($rs->columns()->count() == 0);
+    assert($rs->outcome()->affectedRows == 3);
+    bool $third = guard $rs->more();
+    assert($third);
+    mysql::Row $nine = guard $rs->next()->or(null);
+    assert(($nine['n']->int() ?? 0) == 9);
+    assert($rs->next()->or(null) == null);
+    bool $last = guard $rs->more();
+    assert($last);
+    bool $past = guard $rs->more();
+    assert(!$past);
+    assert(!$db->exec('DO 1')->failed());
+}
+
+test session_query_keeps_the_first_result_and_drops_the_rest
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->sendRows(['1'], SERVER_MORE_RESULTS_EXISTS);
+        $w->sendRows(['2', '3'], SERVER_MORE_RESULTS_EXISTS);
+        $w->send(okPacket());
+        $w->expect(COM_QUERY);
+        $w->send(okPacket(1));
+    });
+    mysql::Connection $db = login($f);
+    mysql::ResultSet $rs = guard $db->query('CALL p()') else ($e) {
+        die("{$e}");
+    }
+    assert($rs->count() == 1 && ($rs[0]['n']->int() ?? 0) == 1);
+    mysql::Outcome $o = guard $db->exec('DO 1') else ($e) {
+        die("{$e}");
+    }
+    assert($o->affectedRows == 1);
+}
+
+test session_batch_reads_every_result
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('mysql_native_password');
+        assert(($a->caps & mysql::protocol::CLIENT_MULTI_STATEMENTS) != 0);
+        $w->send(okPacket());
+        assert($w->expect(COM_QUERY) == 'SELECT 1; UPDATE t; SELECT 2');
+        $w->sendRows(['1'], SERVER_MORE_RESULTS_EXISTS);
+        $w->send(okPacket(4, 0, SERVER_MORE_RESULTS_EXISTS));
+        $w->sendRows(['2']);
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->multiStatements = true;
+    mysql::Connection $db = login($o);
+    array<mysql::ResultSet> $sets = guard $db->batch('SELECT 1; UPDATE t; SELECT 2') else ($e) {
+        die("{$e}");
+    }
+    assert($sets->count() == 3);
+    assert(($sets[0][0]['n']->int() ?? 0) == 1);
+    assert($sets[1]->empty() && $sets[1]->outcome->affectedRows == 4);
+    assert(($sets[2][0]['n']->int() ?? 0) == 2);
+}
+
+test session_a_payload_past_one_packet_both_ways
+{
+    // 16 MiB less one byte is the most one packet carries: longer payloads continue
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        string $q = $w->recvLong();
+        assert($q->size() == 17000001 && $q->byte(0) == COM_QUERY);
+        $w->send(countPacket(1));
+        $w->send(columnDef('blob', 252));
+        string $row = '';
+        mysql::protocol::putLenString($row, str::repeat('a', 17000000));
+        $w->sendLong($row);
+        $w->send(okEnd());
+
+        // a payload that fills its packet exactly is followed by an empty one
+        string $exact = $w->recvLong();
+        assert($exact->size() == 16777215);
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    mysql::ResultSet $rs = guard $db->query(str::repeat('a', 17000000)) else ($e) {
+        die("{$e}");
+    }
+    assert(($rs[0][0]->text() ?? '')->size() == 17000000);
+    string $fill = str::repeat('b', 16777214);
+    assert(!$db->exec($fill)->failed());
+}
+
+test session_a_long_row_streams_too
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->send(countPacket(1));
+        $w->send(columnDef('blob', 252));
+        $w->send(textRowOf(['short']));
+        string $row = '';
+        mysql::protocol::putLenString($row, str::repeat('z', 16777300));
+        $w->sendLong($row);
+        $w->send(textRowOf(['after']));
+        $w->send(okEnd());
+    });
+    mysql::Connection $db = login($f);
+    mysql::Rows $rs = guard $db->stream('SELECT blob') else ($e) {
+        die("{$e}");
+    }
+    array<usize> $sizes = [];
+    while (true) {
+        bool $more = guard $rs->step() else ($e) {
+            die("{$e}");
+        }
+        if (!$more) {
+            break;
+        }
+        string::view $v = guard $rs->view()->view(0);
+        $sizes->push($v->size);
+    }
+    assert($sizes->count() == 3);
+    assert($sizes[0] == 5 && $sizes[1] == 16777300 && $sizes[2] == 5);
+}
+
+test session_a_packet_over_max_packet_is_refused
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->send(countPacket(1));
+        $w->send(columnDef('blob', 252));
+        $w->send(textRowOf([str::repeat('x', 5000)]));
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->maxPacket = 4096;
+    mysql::Connection $db = login($o);
+    // too much to send: refused before anything goes out, and the connection stays
+    result<mysql::Outcome, mysql::Error> $big = $db->exec(str::repeat('y', 5000));
+    assert($big->failed() && $big->failure()->name() == 'tooLarge');
+    assert($db->alive());
+    // too much to receive: the connection goes
+    result<mysql::ResultSet, mysql::Error> $r = $db->query('SELECT blob');
+    assert($r->failed() && $r->failure()->name() == 'tooLarge');
+    assert(!$db->alive());
+}
+
+test session_a_deadline_that_passes_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        // no answer: the client gives up first, and hangs up
+        $w->tryRecv(2000);
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Outcome, mysql::Error> $r = $db->exec('DO SLEEP(10)', by: tcp::Deadline(ms: 100));
+    assert($r->failed() && $r->failure()->name() == 'timeout');
+    assert(!$db->alive());
+}
+
+test session_the_options_timeout_applies_to_every_call
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_PING);
+        $w->tryRecv(2000);
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->timeout = time::duration::millis(100);
+    mysql::Connection $db = login($o);
+    assert($db->ping()->failure()->name() == 'timeout');
+}
+
+test session_a_server_that_hangs_up_mid_answer
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->send(countPacket(2));
+        $w->send(columnDef('a', 3));
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::ResultSet, mysql::Error> $r = $db->query('SELECT a, b');
+    assert($r->failed());
+    assert(!$db->alive());
+}
+
+test session_a_local_file_answered_with_ok_tracks_it
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->send(fileRequest('data.csv'));
+        assert($w->recv()->empty());
+        $w->send(okPacket(0, 0, SERVER_STATUS_IN_TRANS));
+        $w->expect(COM_QUERY);
+        $w->send(okPacket());
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::Outcome, mysql::Error> $r = $db->exec('LOAD DATA LOCAL INFILE \'data.csv\' INTO TABLE t');
+    assert($r->failed() && $r->failure()->name() == 'localInfile');
+    assert($db->inTransaction());
+    assert(!$db->exec('DO 1')->failed());
+}
+
+test session_a_local_file_in_a_multi_result_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(COM_QUERY);
+        $w->send(fileRequest('data.csv'));
+        assert($w->recv()->empty());
+        // the empty file was taken, and another result follows
+        $w->send(okPacket(0, 0, SERVER_MORE_RESULTS_EXISTS));
+        $w->sendRows(['1']);
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->multiStatements = true;
+    mysql::Connection $db = login($o);
+    result<mysql::Outcome, mysql::Error> $r = $db->exec('LOAD DATA LOCAL INFILE \'data.csv\' INTO TABLE t; SELECT 1');
+    assert($r->failed() && $r->failure()->name() == 'localInfile');
+    // the rest of the answer is still on the wire
+    assert(!$db->alive());
+}
+
+test session_connect_to_nothing_is_a_transport_error
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+        die("listen: {$e}");
+    }
+    uint16 $port = $l->local->port;
+    $l->close();
+    mysql::Options $o = mysql::Options($user: 'app');
+    $o->port = $port;
+    $o->connectTimeout = time::duration::secs(2);
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open($o);
+    assert($r->failed() && $r->failure()->name() == 'transport');
+    assert(mysql::Connection::open('nope://')->failure()->name() == 'invalid');
+}
+
+test session_a_server_without_protocol_41_is_refused
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->send(hello('mysql_native_password', SERVER_CAPS & ~mysql::protocol::CLIENT_PROTOCOL_41));
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed() && $r->failure()->name() == 'invalid');
+}
+
+test session_a_greeting_that_does_not_parse
+{
+    Fake $f = fake(function(Wire $w) : void {
+        string $p = '';
+        $p->push(9);
+        $w->send($p);
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed() && $r->failure()->name() == 'malformed');
+}
+
+test session_login_refused_with_the_server_reason
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('mysql_native_password');
+        $w->send(errPacket(1045, '28000', 'Access denied for user \'app\''));
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed() && $r->failure()->is(.accessDenied));
+    assert(($r->failure()->state() ?? '') == '28000');
+}
+
+test session_switch_to_a_plugin_this_client_does_not_speak
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        string $sw = '';
+        $sw->push(254);
+        $sw->append('dialog');
+        $sw->push(0);
+        $sw->append('data');
+        $w->send($sw);
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed());
+    match ($r->failure()) {
+        mysql::Error::auth($a) => {
+            assert($a->message()->contains('dialog'));
+        },
+        else => {
+            die('expected an auth error');
+        },
+    }
+}
+
+test session_the_old_password_switch_is_refused
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('mysql_native_password');
+        string $sw = '';
+        $sw->push(254);
+        $w->send($sw);
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($f));
+    assert($r->failed() && $r->failure()->name() == 'auth');
+    assert($r->failure()->message()->contains('mysql_old_password'));
+}
+
+test session_odd_packets_during_login_are_malformed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('mysql_native_password');
+        $w->send(more('what'));
+    });
+    assert(mysql::Connection::open(optionsFor($f))->failure()->name() == 'malformed');
+
+    Fake $g = fake(function(Wire $w) : void {
+        $w->greet('mysql_native_password');
+        string $p = '';
+        $p->push(7);
+        $w->send($p);
+    });
+    assert(mysql::Connection::open(optionsFor($g))->failure()->name() == 'malformed');
+
+    Fake $h = fake(function(Wire $w) : void {
+        $w->greet('mysql_native_password');
+        string $empty = '';
+        $w->send($empty);
+    });
+    assert(mysql::Connection::open(optionsFor($h))->failure()->name() == 'malformed');
+}
+
+test session_an_unknown_default_plugin_answers_caching_sha2
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('authentication_ldap_sasl_client');
+        assert($a->plugin == 'caching_sha2_password');
+        assert($a->auth == mysql::auth::cachingSha2('secret', scramble()));
+        $w->send(okPacket());
+    });
+    assert(login($f)->plugin == mysql::Plugin::cachingSha2);
+}
+
+test session_an_empty_password_sends_an_empty_proof
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('mysql_native_password');
+        assert($a->auth->empty());
+        assert($a->database->empty());
+        assert(($a->caps & mysql::protocol::CLIENT_CONNECT_WITH_DB) == 0);
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->password = '';
+    $o->database = null;
+    assert(!mysql::Connection::open($o)->failed());
+}
+
+test session_caching_sha2_full_auth_with_a_configured_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        $w->send(fullAuth());
+        // the password, sealed to the 2048 bit key: one block
+        assert($w->recv()->size() == 256);
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->serverKey = PUB;
+    assert(!mysql::Connection::open($o)->failed());
+}
+
+test session_caching_sha2_full_auth_fetching_the_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        $w->send(fullAuth());
+        // the client asks for the key
+        string $ask = $w->recv();
+        assert($ask->size() == 1 && $ask->byte(0) == 2);
+        $w->send(more(PUB));
+        assert($w->recv()->size() == 256);
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->fetchServerKey = true;
+    assert(!mysql::Connection::open($o)->failed());
+}
+
+test session_a_fetched_key_that_is_no_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        $w->send(fullAuth());
+        $w->recv();
+        $w->send(more("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"));
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->fetchServerKey = true;
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open($o);
+    assert($r->failed() && $r->failure()->name() == 'auth');
+    assert($r->failure()->message()->contains('public key'));
+
+    Fake $g = fake(function(Wire $w) : void {
+        $w->greet('caching_sha2_password');
+        $w->send(fullAuth());
+        $w->recv();
+        $w->send(okPacket());
+    });
+    mysql::Options $o2 = optionsFor($g);
+    $o2->fetchServerKey = true;
+    assert(mysql::Connection::open($o2)->failure()->name() == 'malformed');
+}
+
+test session_a_switch_without_a_scramble_then_full_auth
+{
+    // a server that switches with no fresh scramble at all: the password is sealed as it is
+    Fake $f = fake(function(Wire $w) : void {
+        $w->greet('mysql_native_password');
+        $w->send(switchTo('caching_sha2_password'));
+        $w->recv();
+        $w->send(fullAuth());
+        assert($w->recv()->size() == 256);
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->serverKey = PUB;
+    mysql::Connection $db = login($o);
+    assert($db->plugin == mysql::Plugin::cachingSha2);
+}
+
+test session_sha256_password_with_a_configured_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('sha256_password');
+        assert($a->plugin == 'sha256_password');
+        assert($a->auth->size() == 256);
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->serverKey = RSA_PUB;
+    assert(login($o)->plugin == mysql::Plugin::sha256);
+}
+
+test session_sha256_password_fetching_the_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('sha256_password');
+        assert($a->auth->size() == 1 && $a->auth->byte(0) == 1);
+        $w->send(more(PUB));
+        assert($w->recv()->size() == 256);
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->fetchServerKey = true;
+    assert(login($o)->plugin == mysql::Plugin::sha256);
+}
+
+test session_sha256_password_without_a_key_or_a_password
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Answer $a = $w->greet('sha256_password');
+        // no password: one NUL, nothing to seal
+        assert($a->auth == "\0");
+        $w->send(okPacket());
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->password = '';
+    assert(login($o)->plugin == mysql::Plugin::sha256);
+
+    Fake $g = fake(function(Wire $w) : void {
+        $w->send(hello('sha256_password'));
+    });
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open(optionsFor($g));
+    assert($r->failed() && $r->failure()->message()->contains('serverKey'));
+}
+
+test session_a_bad_configured_key_is_an_auth_error
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->send(hello('sha256_password'));
+    });
+    mysql::Options $o = optionsFor($f);
+    $o->serverKey = 'not a key';
+    result<mysql::Connection, mysql::Error> $r = mysql::Connection::open($o);
+    assert($r->failed() && $r->failure()->name() == 'auth');
+}
+
+#[if: os != windows]
+test session_cleartext_and_sha256_over_a_unix_socket
+{
+    int32 $pid = std::env::pid();
+    string $path = "/tmp/libmysql-clear-{$pid}.sock";
+    Fake $f = fakeUnix($path, function(Wire $w) : void {
+        Answer $a = $w->greet('sha256_password');
+        // a unix socket is secure: the password goes as it is
+        assert($a->auth == "secret\0");
+        $w->send(switchTo('mysql_clear_password'));
+        assert($w->recv() == "secret\0");
+        $w->send(okPacket());
+    });
+    mysql::Options $o = mysql::Options($user: 'app', $password: 'secret', $socket: $path);
+    mysql::Connection $db = login($o);
+    assert($db->plugin == mysql::Plugin::clear);
+}
+#[end]

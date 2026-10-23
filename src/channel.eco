@@ -1,0 +1,306 @@
+/**
+ * The packet layer: a 3-byte length, a sequence byte, then the payload, over one TCP or unix
+ * stream. A payload of 16 MiB or more travels as several packets and is joined again here. Any
+ * failure leaves the channel broken: a partly read or written packet leaves no way back to a
+ * packet boundary.
+ */
+
+namespace mysql;
+
+use mysql::protocol::{PACKET_MAX, HEADER_EOF, HEADER_ERR};
+
+internal class Channel
+{
+    private tcp::Stream $stream;
+    private tcp::Reader $reader;
+    // the sequence number the next packet carries, in either direction
+    private uint8 $seq;
+    private usize $maxPacket;
+    private bool $broken;
+    // the body `next` last handed out in place: still in the reader, skipped by the next read
+    private usize $lent;
+    // a payload of 16 MiB or more, joined from its packets; `next` hands out a view of it
+    private string $joined;
+
+    internal constructor(tcp::Stream $stream, usize $maxPacket)
+    {
+        $this->stream = $stream;
+        $this->reader = tcp::Reader(max: PACKET_MAX);
+        $this->seq = 0;
+        $this->maxPacket = $maxPacket;
+        $this->broken = false;
+        $this->lent = 0;
+        $this->joined = '';
+    }
+
+    internal const function alive() : bool
+    {
+        return !$this->broken && !$this->stream->closed();
+    }
+
+    /**
+     * True when the peer is a unix socket, which the server counts as secure.
+     */
+    internal const function local() : bool
+    {
+        return $this->stream->peer->family == tcp::Family::unix;
+    }
+
+    internal function reset() : void
+    {
+        $this->seq = 0;
+    }
+
+    /**
+     * The next payload, joined from as many packets as it took.
+     */
+    internal function read(tcp::Deadline $by) : result<string, Error>
+    {
+        if (!$this->alive()) {
+            return .error(.closed);
+        }
+        $this->release();
+        string $payload = '';
+        bool $first = true;
+        while (true) {
+            string? $head = guard $this->reader->exactly($this->stream, 4, $by) else ($e) {
+                return .error($this->fail($e));
+            }
+            string $h = guard $head else {
+                return .error($this->fail(.timeout));
+            }
+            usize $len = tcp::wire::le24($h, 0) as usize;
+            guard $this->accept($h->byte(3), $payload->size() + $len) else ($e) {
+                return .error($e);
+            }
+            if ($len > 0) {
+                string? $body = guard $this->reader->exactly($this->stream, $len, $by) else ($e) {
+                    return .error($this->fail($e));
+                }
+                string $b = guard $body else {
+                    return .error($this->fail(.timeout));
+                }
+                if ($first && $len < PACKET_MAX) {
+                    return .ok($b);
+                }
+                $payload->append($b);
+            }
+            $first = false;
+            if ($len < PACKET_MAX) {
+                return .ok($payload);
+            }
+        }
+    }
+
+    /**
+     * The next payload, read in place: a view of the bytes where they arrived, no copy. Valid
+     * until the next `next` or `read`. A payload of 16 MiB or more is joined first, and viewed
+     * where it was joined.
+     */
+    internal function next(tcp::Deadline $by) : result<string::view, Error>
+    {
+        if (!$this->alive()) {
+            return .error(.closed);
+        }
+        $this->release();
+        // a streamed result is read ahead in big chunks: the next packet is nearly always all here
+        string::view? $ready = $this->buffered();
+        if ($ready != null) {
+            string::view $b = guard $ready;
+            $this->lend($b);
+            return .ok($b);
+        }
+        bool $head = guard $this->reader->ensure($this->stream, 4, $by) else ($e) {
+            return .error($this->fail($e));
+        }
+        if (!$head) {
+            return .error($this->fail(.timeout));
+        }
+        string::view $h = $this->reader->window(4);
+        usize $len = tcp::wire::le24($h, 0) as usize;
+        if ($len >= PACKET_MAX) {
+            // a long payload: joined from its packets, the header read again on the way
+            string $whole = guard $this->read($by) else ($e) {
+                return .error($e);
+            }
+            $this->joined = $whole;
+            return .ok($this->joined->view());
+        }
+        guard $this->accept($h->byte(3), $len) else ($e) {
+            return .error($e);
+        }
+        $this->reader->skip(4);
+        bool $body = guard $this->reader->ensure($this->stream, $len, $by) else ($e) {
+            return .error($this->fail($e));
+        }
+        if (!$body) {
+            return .error($this->fail(.timeout));
+        }
+        $this->lent = $len;
+        return .ok($this->reader->window($len));
+    }
+
+    /**
+     * The next packet in place, only when it is already buffered and is a row: not EOF, OK or
+     * ERR, and under 16 MiB. Null means call `next`. No `result` to unwrap, which is the point of
+     * every row of a streamed result.
+     */
+    internal function row() : string::view?
+    {
+        if (!$this->alive()) {
+            return null;
+        }
+        $this->release();
+        string::view? $ready = $this->buffered();
+        if ($ready == null) {
+            return null;
+        }
+        string::view $b = guard $ready;
+        if ($b->empty()) {
+            return null;
+        }
+        uint8 $first = $b->byte(0);
+        if ($first == HEADER_EOF || $first == HEADER_ERR) {
+            return null;
+        }
+        $this->lend($b);
+        return $ready;
+    }
+
+    /**
+     * The next packet's body when the whole packet is buffered, under 16 MiB, and carries the
+     * sequence number that is due. Stays in the reader until `lend` takes it.
+     */
+    #[inline]
+    private const function buffered() : string::view?
+    {
+        usize $have = $this->reader->buffered();
+        if ($have < 4) {
+            return null;
+        }
+        string::view $all = $this->reader->window($have);
+        usize $size = tcp::wire::le24($all, 0) as usize;
+        if ($size >= PACKET_MAX || $size > $this->maxPacket || $have - 4 < $size || $all->byte(3) != $this->seq) {
+            return null;
+        }
+        string::view? $body = $all->sub(4, $size);
+        return $body;
+    }
+
+    /**
+     * Hand out the body `buffered` found. The header and body are skipped by the next read.
+     */
+    #[inline]
+    private function lend(string::view $body) : void
+    {
+        $this->seq = $this->seq + 1;
+        $this->lent = 4 + $body->size;
+    }
+
+    /**
+     * Check a packet header: the sequence number must be the one that is due, and the payload it
+     * makes `$total` bytes long must fit `maxPacket`. A bad header breaks the channel.
+     */
+    private function accept(uint8 $seq, usize $total) : status<Error>
+    {
+        if ($seq != $this->seq) {
+            $this->close();
+            return .error(.malformed("packet {$seq} where {$this->seq} was due"));
+        }
+        if ($total > $this->maxPacket) {
+            $this->close();
+            return .error(.tooLarge($total as uint64));
+        }
+        $this->seq = $this->seq + 1;
+        return .ok;
+    }
+
+    /**
+     * Send `$payload`, split into packets of at most 16 MiB less one byte. A payload that fills
+     * the last packet exactly is followed by an empty one, so the reader knows it ended.
+     */
+    internal function write(const string& $payload, tcp::Deadline $by) : status<Error>
+    {
+        if (!$this->alive()) {
+            return .error(.closed);
+        }
+        if ($payload->size() > $this->maxPacket) {
+            return .error(.tooLarge($payload->size() as uint64));
+        }
+        usize $at = 0;
+        while (true) {
+            usize $len = $payload->size() - $at;
+            if ($len > PACKET_MAX) {
+                $len = PACKET_MAX;
+            }
+            string $head = '';
+            tcp::wire::putLe24($head, $len as uint32);
+            $head->push($this->seq);
+            $this->seq = $this->seq + 1;
+            if ($at == 0 && $len == $payload->size()) {
+                guard $this->stream->write($head, $payload, $by) else ($e) {
+                    return .error($this->fail($e));
+                }
+            } else {
+                string $part = $payload->sub($at, $len);
+                guard $this->stream->write($head, $part, $by) else ($e) {
+                    return .error($this->fail($e));
+                }
+            }
+            $at = $at + $len;
+            if ($len < PACKET_MAX) {
+                return .ok;
+            }
+        }
+    }
+
+    /**
+     * Start a command: the sequence resets, and `$payload` is its first packet.
+     */
+    internal function command(const string& $payload, tcp::Deadline $by) : status<Error>
+    {
+        $this->reset();
+        return $this->write($payload, $by);
+    }
+
+    internal function close() : void
+    {
+        $this->broken = true;
+        $this->stream->close();
+    }
+
+    /**
+     * Close the write side and drain what the server still sends. A polite goodbye.
+     */
+    internal function finish(tcp::Deadline $by) : void
+    {
+        $this->broken = true;
+        guard $this->stream->finish($by) else {
+            return;
+        }
+    }
+
+    /**
+     * Past the body `next` lent out, now that whoever read it has moved on.
+     */
+    private function release() : void
+    {
+        if ($this->lent > 0) {
+            $this->reader->skip($this->lent);
+            $this->lent = 0;
+        }
+        if (!$this->joined->empty()) {
+            $this->joined = '';
+        }
+    }
+
+    /**
+     * A socket failure as this library's error. The stream is closed: whatever was half sent or
+     * half read cannot be resynchronised.
+     */
+    private function fail(tcp::Error $e) : Error
+    {
+        $this->close();
+        return transportError($e);
+    }
+}

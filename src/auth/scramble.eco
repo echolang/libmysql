@@ -1,0 +1,57 @@
+/**
+ * The two password proofs. Neither sends the password: each mixes its hash with the scramble the
+ * server sent in this handshake, so a recorded login cannot be replayed.
+ */
+
+namespace mysql::auth;
+
+/**
+ * `$a` XOR `$b`, with `$b` repeated as often as it takes to cover `$a`. An empty `$b` leaves `$a`
+ * as it is: a server may switch plugins without sending a fresh scramble.
+ */
+internal function xor(const string& $a, const string& $b) : string
+{
+    usize $n = $b->size();
+    if ($n == 0) {
+        return $a->clone();
+    }
+    string $out = '';
+    $out->reserve($a->size());
+    usize $i = 0;
+    while ($i < $a->size()) {
+        $out->push($a->byte($i) ^ $b->byte($i % $n));
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+/**
+ * mysql_native_password: SHA1(password) XOR SHA1(scramble + SHA1(SHA1(password))). An empty
+ * password is an empty proof.
+ */
+internal function native(const string& $password, const string& $scramble) : string
+{
+    if ($password->empty()) {
+        return '';
+    }
+    string $once = crypto::sha1($password);
+    string $twice = crypto::sha1($once);
+    string $salted = $scramble->clone();
+    $salted->append($twice);
+    return xor($once, crypto::sha1($salted));
+}
+
+/**
+ * caching_sha2_password's fast path: SHA256(password) XOR SHA256(SHA256(SHA256(password)) +
+ * scramble). An empty password is an empty proof.
+ */
+internal function cachingSha2(const string& $password, const string& $scramble) : string
+{
+    if ($password->empty()) {
+        return '';
+    }
+    string $once = crypto::sha256($password);
+    string $twice = crypto::sha256($once);
+    $twice->append($scramble);
+    return xor($once, crypto::sha256($twice));
+}

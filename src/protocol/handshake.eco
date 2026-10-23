@@ -1,0 +1,176 @@
+/**
+ * The first exchange of a connection: the server's greeting (HandshakeV10) and the client's
+ * answer (HandshakeResponse41).
+ */
+
+namespace mysql::protocol;
+
+internal struct Greeting
+{
+    internal string $server;
+    internal uint32 $connection;
+    // the 20 random bytes both password proofs are salted with
+    internal string $scramble;
+    internal uint32 $capabilities;
+    internal uint8 $collation;
+    internal uint16 $status;
+    internal string $plugin;
+}
+
+internal function greeting(const string& $payload) : result<Greeting, mysql::Error>
+{
+    if ($payload->empty()) {
+        return .error(.malformed('an empty greeting'));
+    }
+    if ($payload->byte(0) == HEADER_ERR) {
+        return .error(err($payload));
+    }
+    if ($payload->byte(0) != 10) {
+        return .error(.malformed("protocol version {$payload->byte(0)}, not 10"));
+    }
+    Cursor $c = Cursor($payload, 1);
+    string $server = $c->nul();
+    uint32 $id = guard $c->u32() else ($e) {
+        return .error($e);
+    }
+    string $scramble = guard $c->bytes(8) else ($e) {
+        return .error($e);
+    }
+    guard $c->skip(1) else ($e) {
+        return .error($e);
+    }
+    uint16 $low = guard $c->u16() else ($e) {
+        return .error($e);
+    }
+    uint32 $caps = $low as uint32;
+    uint8 $collation = 0;
+    uint16 $status = 0;
+    string $plugin = 'mysql_native_password';
+    if (!$c->done()) {
+        $collation = $c->u8()->or(0);
+        $status = $c->u16()->or(0);
+        uint16 $high = $c->u16()->or(0);
+        $caps = $caps | (($high as uint32) << 16);
+        uint8 $authLen = $c->u8()->or(0);
+        guard $c->skip(10) else ($e) {
+            return .error($e);
+        }
+        if (($caps & CLIENT_SECURE_CONNECTION) != 0) {
+            usize $more = 13;
+            if (($authLen as usize) > 21) {
+                $more = ($authLen as usize) - 8;
+            }
+            if ($more > $c->left()) {
+                $more = $c->left();
+            }
+            string $tail = guard $c->bytes($more) else ($e) {
+                return .error($e);
+            }
+            $scramble->append($tail);
+        }
+        if (($caps & CLIENT_PLUGIN_AUTH) != 0) {
+            $plugin = $c->nul();
+        }
+    }
+    // the second part ends in a NUL that is not part of the scramble
+    if ($scramble->size() > 20) {
+        $scramble = $scramble->sub(0, 20);
+    }
+    return .ok(Greeting($server, $id, $scramble, $caps, $collation, $status, $plugin));
+}
+
+/**
+ * The capabilities this client asks for, out of what the server offers.
+ */
+internal function capabilities(uint32 $server, bool $database, bool $multiStatements) : uint32
+{
+    uint32 $want = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS
+        | CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS | CLIENT_PLUGIN_AUTH
+        | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | CLIENT_CONNECT_ATTRS | CLIENT_DEPRECATE_EOF;
+    if ($database) {
+        $want = $want | CLIENT_CONNECT_WITH_DB;
+    }
+    if ($multiStatements) {
+        $want = $want | CLIENT_MULTI_STATEMENTS;
+    }
+    // never LOCAL_FILES, never SSL: neither is offered, whatever the server says
+    return $want & $server;
+}
+
+internal function response(uint32 $caps, uint32 $maxPacket, uint8 $collation, const string& $user, const string& $auth, const string& $database, const string& $plugin) : string
+{
+    string $out = '';
+    tcp::wire::putLe32($out, $caps);
+    tcp::wire::putLe32($out, $maxPacket);
+    $out->push($collation);
+    $out->append(str::repeat("\0", 23));
+    putNul($out, $user);
+    if (($caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) != 0) {
+        putLenString($out, $auth);
+    } else {
+        $out->push($auth->size() as uint8);
+        $out->append($auth);
+    }
+    if (($caps & CLIENT_CONNECT_WITH_DB) != 0) {
+        putNul($out, $database);
+    }
+    if (($caps & CLIENT_PLUGIN_AUTH) != 0) {
+        putNul($out, $plugin);
+    }
+    if (($caps & CLIENT_CONNECT_ATTRS) != 0) {
+        string $attrs = '';
+        putLenString($attrs, '_client_name');
+        putLenString($attrs, 'libmysql');
+        putLenString($attrs, '_client_version');
+        putLenString($attrs, mysql::VERSION);
+        putLenString($attrs, '_runtime');
+        putLenString($attrs, 'echo');
+        putLenString($out, $attrs);
+    }
+    return $out;
+}
+
+/**
+ * A ColumnDefinition41 packet as a `Column`.
+ */
+internal function column(const string& $payload) : result<mysql::Column, mysql::Error>
+{
+    Cursor $c = Cursor($payload);
+    guard $c->string() else ($e) {
+        return .error($e);
+    }
+    string $database = guard $c->string() else ($e) {
+        return .error($e);
+    }
+    string $table = guard $c->string() else ($e) {
+        return .error($e);
+    }
+    guard $c->string() else ($e) {
+        return .error($e);
+    }
+    string $name = guard $c->string() else ($e) {
+        return .error($e);
+    }
+    guard $c->string() else ($e) {
+        return .error($e);
+    }
+    guard $c->count() else ($e) {
+        return .error($e);
+    }
+    uint16 $charset = guard $c->u16() else ($e) {
+        return .error($e);
+    }
+    uint32 $length = guard $c->u32() else ($e) {
+        return .error($e);
+    }
+    uint8 $type = guard $c->u8() else ($e) {
+        return .error($e);
+    }
+    uint16 $flags = guard $c->u16() else ($e) {
+        return .error($e);
+    }
+    uint8 $decimals = guard $c->u8() else ($e) {
+        return .error($e);
+    }
+    return .ok(mysql::Column($name, $table, $database, mysql::ColumnType::from($type), $flags, $charset, $length, $decimals));
+}

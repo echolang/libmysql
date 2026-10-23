@@ -1,0 +1,60 @@
+/**
+ * `mysql::Error`: every case names itself, prints a sentence, and only server errors carry a code
+ * and a state.
+ */
+
+test every_error_names_itself_and_says_why
+{
+    array<mysql::Error> $all = [
+        .server(mysql::ServerError(mysql::ErrorCode::from(1062), '23000', 'dup')),
+        .transport(tcp::Error::closed),
+        .timeout,
+        .closed,
+        .busy,
+        .auth(.needsServerKey),
+        .malformed('short'),
+        .tooLarge(99),
+        .localInfile,
+        .invalid('nope'),
+        .exhausted,
+    ];
+    array<string> $names = ['server', 'transport', 'timeout', 'closed', 'busy', 'auth', 'malformed', 'tooLarge', 'localInfile', 'invalid', 'exhausted'];
+    foreach ($all as $i => const &$e) {
+        assert($e->name() == $names[$i]);
+        assert(!$e->message()->empty());
+        assert("{$e}" == $e->message());
+        assert(($e->code() == null) == ($i != 0));
+        assert(($e->state() == null) == ($i != 0));
+        assert(!$e->retryable());
+    }
+    mysql::Error $big = .tooLarge(99);
+    assert($big->message()->contains('99'));
+    mysql::Error $bad = .malformed('short');
+    assert($bad->message() == 'malformed packet: short');
+    mysql::Error $inv = .invalid('nope');
+    assert($inv->message() == 'nope');
+}
+
+test server_errors_answer_by_code
+{
+    mysql::Error $e = .server(mysql::ServerError(mysql::ErrorCode::from(1205), 'HY000', 'Lock wait timeout exceeded'));
+    assert($e->is(.lockWaitTimeout));
+    assert(!$e->is(.deadlock));
+    assert($e->retryable());
+    mysql::ServerError $s = mysql::ServerError(mysql::ErrorCode::from(1146), '42S02', 'no table');
+    assert("{$s}" == '1146 (42S02): no table');
+    mysql::Error $transport = .transport(tcp::Error::closed);
+    assert(!$transport->is(.lockWaitTimeout));
+}
+
+test auth_errors_say_what_to_do
+{
+    array<mysql::AuthError> $all = [.unsupported('dialog'), .needsSecureTransport, .needsServerKey, .badKey('truncated')];
+    foreach ($all as const &$a) {
+        assert(!$a->message()->empty());
+    }
+    mysql::AuthError $u = .unsupported('dialog');
+    assert($u->message()->contains('dialog'));
+    mysql::AuthError $k = .badKey('truncated');
+    assert($k->message()->contains('truncated'));
+}

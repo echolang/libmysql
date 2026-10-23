@@ -1,0 +1,213 @@
+/**
+ * RSA public-key encryption with OAEP padding (SHA-1 and MGF1-SHA-1). The one RSA operation
+ * MySQL's caching_sha2_password and sha256_password ask of a client: encrypting the password to
+ * the server's key when there is no TLS. Keys come as PEM, in either of the two shapes servers
+ * hand out.
+ */
+
+namespace mysql::auth;
+
+internal struct PublicKey
+{
+    internal Big $n;
+    internal Big $e;
+
+    /**
+     * The modulus in bytes: the size of every ciphertext.
+     */
+    internal const function size() : usize
+    {
+        return ($this->n->bits() + 7) / 8;
+    }
+}
+
+/**
+ * Where a DER element's contents start and how long they are.
+ */
+internal struct Der
+{
+    internal uint8 $tag;
+    internal usize $at;
+    internal usize $len;
+}
+
+/**
+ * The DER element at `$at` of `$der`, its length checked against what is there.
+ */
+internal function element(const string& $der, usize $at) : result<Der, string>
+{
+    if ($at + 2 > $der->size()) {
+        return .error('truncated');
+    }
+    uint8 $tag = $der->byte($at);
+    uint8 $first = $der->byte($at + 1);
+    usize $pos = $at + 2;
+    usize $len = 0;
+    if ($first < 128) {
+        $len = $first as usize;
+    } else {
+        usize $count = ($first & 127) as usize;
+        if ($count == 0 || $count > 4 || $pos + $count > $der->size()) {
+            return .error('a length that does not fit');
+        }
+        usize $i = 0;
+        while ($i < $count) {
+            $len = ($len << 8) | ($der->byte($pos + $i) as usize);
+            $i = $i + 1;
+        }
+        $pos = $pos + $count;
+    }
+    if ($pos + $len > $der->size()) {
+        return .error('truncated');
+    }
+    return .ok(Der($tag, $pos, $len));
+}
+
+/**
+ * The element at `$at`, which has to carry `$tag`.
+ */
+internal function expect(const string& $der, usize $at, uint8 $tag, const string& $what) : result<Der, string>
+{
+    Der $d = guard element($der, $at) else ($e) {
+        return .error($e);
+    }
+    if ($d->tag != $tag) {
+        return .error("expected {$what}");
+    }
+    return .ok($d);
+}
+
+/**
+ * `SEQUENCE { INTEGER n, INTEGER e }` at `$at`: the PKCS#1 RSAPublicKey.
+ */
+internal function rsaKey(const string& $der, usize $at) : result<PublicKey, string>
+{
+    Der $seq = guard expect($der, $at, 48, 'a SEQUENCE') else ($e) {
+        return .error($e);
+    }
+    Der $n = guard expect($der, $seq->at, 2, 'the modulus') else ($e) {
+        return .error($e);
+    }
+    Der $e = guard expect($der, $n->at + $n->len, 2, 'the exponent') else ($err) {
+        return .error($err);
+    }
+    Big $modulus = Big(bytes: $der->sub($n->at, $n->len));
+    Big $exponent = Big(bytes: $der->sub($e->at, $e->len));
+    if ($modulus->bits() < 512 || $exponent->zero()) {
+        return .error('not a usable RSA key');
+    }
+    return .ok(PublicKey($modulus, $exponent));
+}
+
+/**
+ * A key from PEM: `BEGIN PUBLIC KEY` (SubjectPublicKeyInfo, what MySQL sends) or
+ * `BEGIN RSA PUBLIC KEY` (PKCS#1).
+ */
+internal function publicKey(const string& $pem) : result<PublicKey, string>
+{
+    usize $begin = $pem->find('-----BEGIN ');
+    if ($begin == $pem->size()) {
+        return .error('no PEM header');
+    }
+    usize $headerEnd = $pem->find("-----\n", $begin + 11);
+    if ($headerEnd == $pem->size()) {
+        $headerEnd = $pem->find("-----\r\n", $begin + 11);
+    }
+    if ($headerEnd == $pem->size()) {
+        return .error('no PEM header');
+    }
+    string $label = $pem->sub($begin + 11, $headerEnd - $begin - 11);
+    usize $bodyStart = $pem->find("\n", $headerEnd) + 1;
+    usize $end = $pem->find('-----END ', $bodyStart);
+    if ($end == $pem->size()) {
+        return .error('no PEM footer');
+    }
+    string $der = guard unbase64($pem->sub($bodyStart, $end - $bodyStart)) else {
+        return .error('the PEM body is not base64');
+    }
+
+    if ($label == 'RSA PUBLIC KEY') {
+        return rsaKey($der, 0);
+    }
+    if ($label != 'PUBLIC KEY') {
+        return .error("a '{$label}' block, not a public key");
+    }
+    // SubjectPublicKeyInfo: SEQUENCE { SEQUENCE { OID rsaEncryption, NULL }, BIT STRING { key } }
+    Der $outer = guard expect($der, 0, 48, 'a SEQUENCE') else ($e) {
+        return .error($e);
+    }
+    Der $algorithm = guard expect($der, $outer->at, 48, 'the algorithm') else ($e) {
+        return .error($e);
+    }
+    Der $oid = guard expect($der, $algorithm->at, 6, 'an OID') else ($e) {
+        return .error($e);
+    }
+    // 1.2.840.113549.1.1.1
+    string $rsa = '';
+    array<uint8> $oidBytes = [42, 134, 72, 134, 247, 13, 1, 1, 1];
+    foreach ($oidBytes as $b) {
+        $rsa->push($b);
+    }
+    if ($der->sub($oid->at, $oid->len) != $rsa) {
+        return .error('not an RSA key');
+    }
+    Der $bits = guard expect($der, $algorithm->at + $algorithm->len, 3, 'a BIT STRING') else ($e) {
+        return .error($e);
+    }
+    if ($bits->len < 1 || $der->byte($bits->at) != 0) {
+        return .error('a BIT STRING with unused bits');
+    }
+    return rsaKey($der, $bits->at + 1);
+}
+
+/**
+ * MGF1 over SHA-1: `$len` bytes from `$seed`.
+ */
+internal function mgf1(const string& $seed, usize $len) : string
+{
+    string $out = '';
+    uint32 $counter = 0;
+    while ($out->size() < $len) {
+        string $block = $seed->clone();
+        tcp::wire::putBe32($block, $counter);
+        $out->append(crypto::sha1($block));
+        $counter = $counter + 1;
+    }
+    return $out->sub(0, $len);
+}
+
+/**
+ * RSAES-OAEP-ENCRYPT (RFC 8017, 7.1.1) with SHA-1, an empty label, and the 20-byte `$seed` given.
+ * Tests pass a fixed seed; `encrypt` passes a random one.
+ */
+internal function encrypt(const PublicKey& $key, const string& $message, const string& $seed) : result<string, string>
+{
+    usize $k = $key->size();
+    usize $h = 20;
+    if ($message->size() + 2 * $h + 2 > $k) {
+        return .error('the message is too long for the key');
+    }
+    string $db = crypto::sha1('');
+    $db->append(str::repeat("\0", $k - $message->size() - 2 * $h - 2));
+    $db->push(1);
+    $db->append($message);
+    string $maskedDb = xor($db, mgf1($seed, $k - $h - 1));
+    string $maskedSeed = xor($seed, mgf1($maskedDb, $h));
+
+    string $em = "\0";
+    $em->append($maskedSeed);
+    $em->append($maskedDb);
+    Big $c = Big(bytes: $em)->power($key->e, $key->n);
+    return .ok($c->bytes($k));
+}
+
+/**
+ * RSAES-OAEP-ENCRYPT with a fresh random seed.
+ */
+internal function encrypt(const PublicKey& $key, const string& $message) : result<string, string>
+{
+    string $seed = guard crypto::random(20) else {
+        return .error('no randomness for the OAEP seed');
+    }
+    return encrypt($key, $message, $seed);
+}

@@ -1,0 +1,602 @@
+namespace mysql;
+
+/**
+ * A DATE. Zero months and days are what MySQL stores for `0000-00-00`.
+ */
+public struct Date
+{
+    public uint16 $year = 0;
+    public uint8 $month = 0;
+    public uint8 $day = 0;
+
+    /**
+     * `YYYY-MM-DD`, as MySQL prints it, or null when `$text` is not one.
+     */
+    public static function parse(const string& $text) : Date?
+    {
+        if ($text->size() != 10 || $text->byte(4) != 45 || $text->byte(7) != 45) {
+            return null;
+        }
+        uint32 $y = guard digits($text, 0, 4) else {
+            return null;
+        }
+        uint32 $m = guard digits($text, 5, 2) else {
+            return null;
+        }
+        uint32 $d = guard digits($text, 8, 2) else {
+            return null;
+        }
+        Date? $out = Date($y as uint16, $m as uint8, $d as uint8);
+        return $out;
+    }
+}
+
+/**
+ * A DATETIME or a TIMESTAMP, to the microsecond.
+ */
+public struct DateTime
+{
+    public uint16 $year = 0;
+    public uint8 $month = 0;
+    public uint8 $day = 0;
+    public uint8 $hour = 0;
+    public uint8 $minute = 0;
+    public uint8 $second = 0;
+    public uint32 $micro = 0;
+
+    public constructor(uint16 $year = 0, uint8 $month = 0, uint8 $day = 0, uint8 $hour = 0, uint8 $minute = 0, uint8 $second = 0, uint32 $micro = 0)
+    {
+        $this->year = $year;
+        $this->month = $month;
+        $this->day = $day;
+        $this->hour = $hour;
+        $this->minute = $minute;
+        $this->second = $second;
+        $this->micro = $micro;
+    }
+
+    /**
+     * Midnight on `$date`.
+     */
+    public constructor(midnight: Date $date)
+    {
+        $this->year = $date->year;
+        $this->month = $date->month;
+        $this->day = $date->day;
+    }
+
+    public const function date() : Date
+    {
+        return Date($this->year, $this->month, $this->day);
+    }
+
+    /**
+     * `YYYY-MM-DD HH:MM:SS` with an optional `.ffffff`, or a bare date. Null when it is not one.
+     */
+    public static function parse(const string& $text) : DateTime?
+    {
+        if ($text->size() == 10) {
+            Date $d = guard Date::parse($text) else {
+                return null;
+            }
+            DateTime? $only = DateTime(midnight: $d);
+            return $only;
+        }
+        if ($text->size() < 19 || $text->byte(10) != 32) {
+            return null;
+        }
+        Date $date = guard Date::parse($text->sub(0, 10)) else {
+            return null;
+        }
+        Time $clock = guard Time::parse($text->sub(11, $text->size() - 11)) else {
+            return null;
+        }
+        if ($clock->negative || $clock->hours > 23) {
+            return null;
+        }
+        DateTime? $out = DateTime($date->year, $date->month, $date->day, $clock->hours as uint8, $clock->minute, $clock->second, $clock->micro);
+        return $out;
+    }
+}
+
+/**
+ * A TIME: a signed span that may pass 24 hours. MySQL allows up to 838:59:59.
+ */
+public struct Time
+{
+    public bool $negative = false;
+    public uint32 $hours = 0;
+    public uint8 $minute = 0;
+    public uint8 $second = 0;
+    public uint32 $micro = 0;
+
+    /**
+     * `[-]H:MM:SS` with any number of hour digits and an optional `.ffffff`. Null when it is not
+     * one.
+     */
+    public static function parse(const string& $text) : Time?
+    {
+        usize $at = 0;
+        bool $neg = false;
+        if ($text->size() > 0 && $text->byte(0) == 45) {
+            $neg = true;
+            $at = 1;
+        }
+        usize $colon = $text->find(':', $at);
+        if ($colon == $text->size() || $colon == $at || $text->size() < $colon + 6 || $text->byte($colon + 3) != 58) {
+            return null;
+        }
+        uint32 $h = guard digits($text, $at, $colon - $at) else {
+            return null;
+        }
+        uint32 $m = guard digits($text, $colon + 1, 2) else {
+            return null;
+        }
+        uint32 $s = guard digits($text, $colon + 4, 2) else {
+            return null;
+        }
+        uint32 $micro = 0;
+        usize $end = $colon + 6;
+        if ($text->size() > $end) {
+            if ($text->byte($end) != 46) {
+                return null;
+            }
+            usize $places = $text->size() - $end - 1;
+            if ($places == 0 || $places > 6) {
+                return null;
+            }
+            uint32 $frac = guard digits($text, $end + 1, $places) else {
+                return null;
+            }
+            $micro = $frac;
+            usize $pad = $places;
+            while ($pad < 6) {
+                $micro = $micro * 10;
+                $pad = $pad + 1;
+            }
+        }
+        if ($m > 59 || $s > 59) {
+            return null;
+        }
+        Time? $out = Time($neg, $h, $m as uint8, $s as uint8, $micro);
+        return $out;
+    }
+}
+
+/**
+ * The decimal digits of `$text` from `$at` for `$n` bytes, or null when one is not a digit.
+ */
+internal function digits(const string& $text, usize $at, usize $n) : uint32?
+{
+    if ($n == 0 || $n > 9 || $at + $n > $text->size()) {
+        return null;
+    }
+    uint32 $v = 0;
+    usize $i = 0;
+    while ($i < $n) {
+        uint8 $b = $text->byte($at + $i);
+        if ($b < 48 || $b > 57) {
+            return null;
+        }
+        $v = $v * 10 + ($b - 48) as uint32;
+        $i = $i + 1;
+    }
+    uint32? $out = $v;
+    return $out;
+}
+
+/**
+ * One column value, the same shape whether it came over the text protocol or the binary one, and
+ * one parameter value on the way in. Typed reads answer null when the value is not that type, so
+ * `guard`, `??` and `?->` do the rest.
+ *
+ * ```echo
+ * mysql::Value $v = .int(12);
+ * echo $v->int() ?? 0;        // 12
+ * echo "{$v}";                // 12
+ * ```
+ */
+public enum Value
+{
+    /**
+     * SQL NULL.
+     */
+    case none;
+
+    case int(int64 $v);
+    case uint(uint64 $v);
+    case float(float64 $v);
+
+    /**
+     * A DECIMAL, kept as the server wrote it so nothing is rounded.
+     */
+    case decimal(string $v);
+
+    /**
+     * Text: a CHAR, VARCHAR, TEXT, ENUM, SET or JSON column.
+     */
+    case text(string $v);
+
+    /**
+     * Bytes: a BLOB or a BINARY column, or a parameter that must not be read as text.
+     */
+    case bytes(string $v);
+
+    case date(Date $v);
+    case datetime(DateTime $v);
+    case time(Time $v);
+
+    #[implicit]
+    public static function from(int32 $v) : Value
+    {
+        return .int($v as int64);
+    }
+
+    #[implicit]
+    public static function from(int64 $v) : Value
+    {
+        return .int($v);
+    }
+
+    #[implicit]
+    public static function from(uint32 $v) : Value
+    {
+        return .uint($v as uint64);
+    }
+
+    #[implicit]
+    public static function from(uint64 $v) : Value
+    {
+        return .uint($v);
+    }
+
+    #[implicit]
+    public static function from(float64 $v) : Value
+    {
+        return .float($v);
+    }
+
+    /**
+     * A `bool` as `int` 0 or 1.
+     */
+    #[implicit]
+    public static function from(bool $v) : Value
+    {
+        if ($v) {
+            return .int(1);
+        }
+        return .int(0);
+    }
+
+    #[implicit]
+    public static function from(string $v) : Value
+    {
+        return .text($v);
+    }
+
+    #[implicit]
+    public static function from(Date $v) : Value
+    {
+        return .date($v);
+    }
+
+    #[implicit]
+    public static function from(DateTime $v) : Value
+    {
+        return .datetime($v);
+    }
+
+    #[implicit]
+    public static function from(Time $v) : Value
+    {
+        return .time($v);
+    }
+
+    /**
+     * A nullable: SQL NULL when it is null.
+     */
+    #[implicit]
+    public static function from(int32? $v) : Value
+    {
+        int32 $n = guard $v else {
+            return .none;
+        }
+        return .int($n as int64);
+    }
+
+    #[implicit]
+    public static function from(int64? $v) : Value
+    {
+        int64 $n = guard $v else {
+            return .none;
+        }
+        return .int($n);
+    }
+
+    #[implicit]
+    public static function from(uint64? $v) : Value
+    {
+        uint64 $n = guard $v else {
+            return .none;
+        }
+        return .uint($n);
+    }
+
+    #[implicit]
+    public static function from(float64? $v) : Value
+    {
+        float64 $n = guard $v else {
+            return .none;
+        }
+        return .float($n);
+    }
+
+    #[implicit]
+    public static function from(bool? $v) : Value
+    {
+        bool $b = guard $v else {
+            return .none;
+        }
+        if ($b) {
+            return .int(1);
+        }
+        return .int(0);
+    }
+
+    #[implicit]
+    public static function from(string? $v) : Value
+    {
+        string $s = guard $v else {
+            return .none;
+        }
+        return .text($s);
+    }
+
+    #[implicit]
+    public static function from(Date? $v) : Value
+    {
+        Date $d = guard $v else {
+            return .none;
+        }
+        return .date($d);
+    }
+
+    #[implicit]
+    public static function from(DateTime? $v) : Value
+    {
+        DateTime $d = guard $v else {
+            return .none;
+        }
+        return .datetime($d);
+    }
+
+    #[implicit]
+    public static function from(Time? $v) : Value
+    {
+        Time $t = guard $v else {
+            return .none;
+        }
+        return .time($t);
+    }
+
+    /**
+     * True when this is SQL NULL.
+     */
+    public const function isNull() : bool
+    {
+        match ($this) {
+            Value::none => {
+                return true;
+            },
+            else => {
+                return false;
+            },
+        }
+    }
+
+    /**
+     * A signed integer, or an unsigned one that fits.
+     */
+    public const function int() : int64?
+    {
+        match ($this) {
+            Value::int($v) => {
+                int64? $out = $v;
+                return $out;
+            },
+            Value::uint($v) => {
+                uint64 $n = $v;
+                if ($n > 9223372036854775807) {
+                    return null;
+                }
+                int64? $out = $n as int64;
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * An unsigned integer, or a signed one that is not negative.
+     */
+    public const function uint() : uint64?
+    {
+        match ($this) {
+            Value::uint($v) => {
+                uint64? $out = $v;
+                return $out;
+            },
+            Value::int($v) => {
+                int64 $n = $v;
+                if ($n < 0) {
+                    return null;
+                }
+                uint64? $out = $n as uint64;
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * A float, or any number: an integer, or a decimal parsed (and rounded) to a float.
+     */
+    public const function float() : float64?
+    {
+        match ($this) {
+            Value::float($v) => {
+                float64? $out = $v;
+                return $out;
+            },
+            Value::int($v) => {
+                int64 $n = $v;
+                float64? $out = $n as float64;
+                return $out;
+            },
+            Value::uint($v) => {
+                uint64 $n = $v;
+                float64? $out = $n as float64;
+                return $out;
+            },
+            Value::decimal($v) => {
+                return str::float($v);
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * Text, a decimal as the server wrote it, or bytes as they are.
+     */
+    public const function text() : string?
+    {
+        match ($this) {
+            Value::text($v) => {
+                string? $out = $v;
+                return $out;
+            },
+            Value::decimal($v) => {
+                string? $out = $v;
+                return $out;
+            },
+            Value::bytes($v) => {
+                string? $out = $v;
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * Bytes, or text as its bytes.
+     */
+    public const function bytes() : string?
+    {
+        match ($this) {
+            Value::bytes($v) => {
+                string? $out = $v;
+                return $out;
+            },
+            Value::text($v) => {
+                string? $out = $v;
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * True or false from an integer: zero is false, anything else true.
+     */
+    public const function bool() : bool?
+    {
+        match ($this) {
+            Value::int($v) => {
+                bool? $out = $v != 0;
+                return $out;
+            },
+            Value::uint($v) => {
+                bool? $out = $v != 0;
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    public const function date() : Date?
+    {
+        match ($this) {
+            Value::date($v) => {
+                Date? $out = $v;
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * A DATETIME or TIMESTAMP, or a DATE at midnight.
+     */
+    public const function datetime() : DateTime?
+    {
+        match ($this) {
+            Value::datetime($v) => {
+                DateTime? $out = $v;
+                return $out;
+            },
+            Value::date($v) => {
+                DateTime? $out = DateTime(midnight: $v);
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    public const function time() : Time?
+    {
+        match ($this) {
+            Value::time($v) => {
+                Time? $out = $v;
+                return $out;
+            },
+            else => {
+                return null;
+            },
+        }
+    }
+
+    /**
+     * What the value is, in a word: `null`, `int`, `text` and so on.
+     */
+    public const function kind() : string
+    {
+        return match ($this) {
+            Value::none => 'null',
+            Value::int($v) => 'int',
+            Value::uint($v) => 'uint',
+            Value::float($v) => 'float',
+            Value::decimal($v) => 'decimal',
+            Value::text($v) => 'text',
+            Value::bytes($v) => 'bytes',
+            Value::date($v) => 'date',
+            Value::datetime($v) => 'datetime',
+            Value::time($v) => 'time',
+        };
+    }
+}

@@ -1,0 +1,134 @@
+/**
+ * Named placeholders. MySQL only knows `?`, so `:name` is rewritten to `?` once per SQL string,
+ * names kept in the order they appear. The scan knows MySQL's quoting and comments, so a `:`
+ * inside a string, an identifier or a comment is left alone, and so are `:=` and `::`.
+ */
+
+namespace mysql::protocol;
+
+internal struct Placeholders
+{
+    // the SQL the server is sent: every `:name` replaced by `?`
+    internal string $sql;
+    // the name behind each `?`, in order; empty when the SQL uses plain `?`
+    internal array<string> $names;
+    // how many `?` there are, either way
+    internal usize $count;
+}
+
+private function identStart(uint8 $c) : bool
+{
+    return ($c >= 65 && $c <= 90) || ($c >= 97 && $c <= 122) || $c == 95;
+}
+
+private function identPart(uint8 $c) : bool
+{
+    return identStart($c) || ($c >= 48 && $c <= 57);
+}
+
+/**
+ * The end of the quoted span opening at `$at` with quote `$q`: the index after the closing quote,
+ * or the end of the SQL when it never closes. The server will say so.
+ */
+private function quoted(const string& $sql, usize $at, uint8 $q) : usize
+{
+    usize $i = $at + 1;
+    usize $n = $sql->size();
+    while ($i < $n) {
+        uint8 $c = $sql->byte($i);
+        if ($c == 92 && $q != 96 && $i + 1 < $n) {
+            $i = $i + 2;
+            continue;
+        }
+        if ($c == $q) {
+            if ($i + 1 < $n && $sql->byte($i + 1) == $q) {
+                $i = $i + 2;
+                continue;
+            }
+            return $i + 1;
+        }
+        $i = $i + 1;
+    }
+    return $n;
+}
+
+/**
+ * `$sql` with `:name` placeholders rewritten. `.invalid` when it mixes `?` and `:name`, or has
+ * more placeholders than one statement may carry (65535).
+ */
+internal function placeholders(const string& $sql) : result<Placeholders, mysql::Error>
+{
+    string $out = '';
+    $out->reserve($sql->size());
+    array<string> $names = array<string>();
+    usize $plain = 0;
+    usize $n = $sql->size();
+    usize $i = 0;
+    while ($i < $n) {
+        uint8 $c = $sql->byte($i);
+        // quoted strings and identifiers
+        if ($c == 39 || $c == 34 || $c == 96) {
+            usize $end = quoted($sql, $i, $c);
+            $out->append($sql->sub($i, $end - $i));
+            $i = $end;
+            continue;
+        }
+        // comments: '-- ' and '#' to the end of the line, '/* */' blocks. '/*!' and '/*+' are
+        // executed or read by the server, so their insides are scanned like code
+        bool $dashes = $c == 45 && $i + 1 < $n && $sql->byte($i + 1) == 45 && ($i + 2 >= $n || $sql->byte($i + 2) <= 32);
+        if ($dashes || $c == 35) {
+            usize $eol = $sql->find("\n", $i);
+            $out->append($sql->sub($i, $eol - $i));
+            $i = $eol;
+            continue;
+        }
+        if ($c == 47 && $i + 1 < $n && $sql->byte($i + 1) == 42) {
+            bool $hint = $i + 2 < $n && ($sql->byte($i + 2) == 33 || $sql->byte($i + 2) == 43);
+            if (!$hint) {
+                usize $close = $sql->find('*/', $i + 2);
+                usize $stop = $n;
+                if ($close < $n) {
+                    $stop = $close + 2;
+                }
+                $out->append($sql->sub($i, $stop - $i));
+                $i = $stop;
+                continue;
+            }
+        }
+        if ($c == 63) {
+            $plain = $plain + 1;
+            $out->push($c);
+            $i = $i + 1;
+            continue;
+        }
+        if ($c == 58) {
+            // '::' and ':=' are operators, and a ':' after another one is part of '::'
+            bool $doubled = $i + 1 < $n && $sql->byte($i + 1) == 58;
+            if ($doubled) {
+                $out->append('::');
+                $i = $i + 2;
+                continue;
+            }
+            if ($i + 1 < $n && identStart($sql->byte($i + 1))) {
+                usize $j = $i + 1;
+                while ($j < $n && identPart($sql->byte($j))) {
+                    $j = $j + 1;
+                }
+                $names->push($sql->sub($i + 1, $j - $i - 1));
+                $out->push(63);
+                $i = $j;
+                continue;
+            }
+        }
+        $out->push($c);
+        $i = $i + 1;
+    }
+    if ($plain > 0 && !$names->empty()) {
+        return .error(.invalid('the SQL mixes ? and :name placeholders'));
+    }
+    usize $count = $plain + $names->count();
+    if ($count > 65535) {
+        return .error(.invalid("{$count} placeholders, and one statement may carry 65535"));
+    }
+    return .ok(Placeholders($out, $names, $count));
+}

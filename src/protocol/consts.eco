@@ -1,0 +1,60 @@
+/**
+ * The numbers the protocol is made of: capability bits, command bytes, server status bits and
+ * column flags. Constants rather than enums, because each travels as a bit in a mask.
+ */
+
+namespace mysql::protocol;
+
+// capability bits, the client's and the server's
+internal const uint32 CLIENT_LONG_PASSWORD = 1;
+internal const uint32 CLIENT_FOUND_ROWS = 2;
+internal const uint32 CLIENT_LONG_FLAG = 4;
+internal const uint32 CLIENT_CONNECT_WITH_DB = 8;
+internal const uint32 CLIENT_LOCAL_FILES = 128;
+internal const uint32 CLIENT_PROTOCOL_41 = 512;
+internal const uint32 CLIENT_SSL = 2048;
+internal const uint32 CLIENT_TRANSACTIONS = 8192;
+internal const uint32 CLIENT_SECURE_CONNECTION = 32768;
+internal const uint32 CLIENT_MULTI_STATEMENTS = 65536;
+internal const uint32 CLIENT_MULTI_RESULTS = 131072;
+internal const uint32 CLIENT_PS_MULTI_RESULTS = 262144;
+internal const uint32 CLIENT_PLUGIN_AUTH = 524288;
+internal const uint32 CLIENT_CONNECT_ATTRS = 1048576;
+internal const uint32 CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 2097152;
+internal const uint32 CLIENT_DEPRECATE_EOF = 16777216;
+
+// command bytes, the first byte of every command packet
+internal const uint8 COM_QUIT = 1;
+internal const uint8 COM_INIT_DB = 2;
+internal const uint8 COM_QUERY = 3;
+internal const uint8 COM_PING = 14;
+internal const uint8 COM_STMT_PREPARE = 22;
+internal const uint8 COM_STMT_EXECUTE = 23;
+internal const uint8 COM_STMT_CLOSE = 25;
+internal const uint8 COM_STMT_RESET = 26;
+internal const uint8 COM_RESET_CONNECTION = 31;
+
+// server status bits, in every OK and EOF packet
+internal const uint16 SERVER_STATUS_IN_TRANS = 1;
+internal const uint16 SERVER_STATUS_AUTOCOMMIT = 2;
+internal const uint16 SERVER_MORE_RESULTS_EXISTS = 8;
+
+// column definition flags
+internal const uint16 FLAG_NOT_NULL = 1;
+internal const uint16 FLAG_PRIMARY_KEY = 2;
+internal const uint16 FLAG_UNSIGNED = 32;
+internal const uint16 FLAG_BINARY = 128;
+internal const uint16 FLAG_AUTO_INCREMENT = 512;
+
+// the charset number of binary strings: a column in it holds bytes, not text
+internal const uint16 CHARSET_BINARY = 63;
+
+// one packet carries at most this many payload bytes; a longer payload continues in the next
+internal const usize PACKET_MAX = 16777215;
+
+// response headers
+internal const uint8 HEADER_OK = 0;
+internal const uint8 HEADER_MORE = 1;
+internal const uint8 HEADER_LOCAL_INFILE = 251;
+internal const uint8 HEADER_EOF = 254;
+internal const uint8 HEADER_ERR = 255;

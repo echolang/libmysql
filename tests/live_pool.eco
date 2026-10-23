@@ -1,0 +1,133 @@
+#[if: mysql]
+
+use std::thread;
+
+internal function pool(usize $max) : mysql::Pool
+{
+    return mysql::Pool(liveOptions('MYSQL_TEST_URL'), mysql::PoolOptions($max: $max));
+}
+
+#[group: 'live']
+test live_pool_runs_out_and_recovers
+{
+    mysql::Pool $p = pool(2);
+    mysql::Lease $a = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    mysql::Lease $b = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    assert($p->open() == 2);
+    result<mysql::Lease, mysql::Error> $none = $p->acquire(by: tcp::Deadline(ms: 100));
+    assert($none->failed() && $none->failure()->name() == 'exhausted');
+    $a->release();
+    assert($p->idle() == 1);
+    mysql::Lease $c = guard $p->acquire(by: tcp::Deadline(ms: 100)) else ($e) {
+        die("{$e}");
+    }
+    assert($p->open() == 2);
+    assert(rows($c->db(), 'SELECT 1')->count() == 1);
+}
+
+#[group: 'live']
+test live_pool_hands_a_returned_connection_to_the_waiter
+{
+    mysql::Pool $p = pool(1);
+    mysql::Lease $held = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    uint32 $heldId = $held->db()->id;
+    thread::task<uint32> $waiter = guard thread::spawn(function() : uint32 {
+        mysql::Lease $l = guard $p->acquire(by: tcp::Deadline(ms: 5000)) else ($e) {
+            die("waiter: {$e}");
+        }
+        return $l->db()->id;
+    }) else ($e) {
+        die($e->message());
+    }
+    thread::sleep(100);
+    $held->release();
+    assert($waiter->wait() == $heldId);
+}
+
+#[group: 'live']
+test live_pool_shared_by_eight_threads
+{
+    mysql::Pool $p = pool(3);
+    array<thread::task<int64>> $workers = array<thread::task<int64>>();
+    foreach (0 .. 8 as $w) {
+        int32 $base = $w * 100;
+        thread::task<int64> $t = guard thread::spawn(function() : int64 {
+            int64 $sum = 0;
+            foreach (0 .. 20 as $i) {
+                int32 $n = $base + $i;
+                mysql::ResultSet $rs = guard $p->query('SELECT CAST(? AS SIGNED) AS n', [$n]) else ($e) {
+                    die("worker: {$e}");
+                }
+                $sum = $sum + ($rs->rows[0]['n']->int() ?? 0);
+            }
+            return $sum;
+        }) else ($e) {
+            die($e->message());
+        }
+        $workers->push($t);
+    }
+    int64 $total = 0;
+    foreach ($workers as &$t) {
+        $total = $total + $t->wait();
+    }
+    // the sum of (100w + i) for w < 8, i < 20
+    assert($total == 56000 + 1520);
+    assert($p->open() <= 3);
+}
+
+#[group: 'live']
+test live_pool_rolls_back_a_lease_dropped_in_a_transaction
+{
+    mysql::Pool $p = pool(1);
+    run(live(), 'DROP TABLE IF EXISTS leased');
+    run(live(), 'CREATE TABLE leased (id INT PRIMARY KEY) ENGINE=InnoDB');
+    {
+        mysql::Lease $l = guard $p->acquire() else ($e) {
+            die("{$e}");
+        }
+        run($l->db(), 'START TRANSACTION');
+        run($l->db(), 'INSERT INTO leased VALUES (1)');
+        assert($l->db()->inTransaction());
+    }
+    mysql::Lease $again = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    assert(!$again->db()->inTransaction());
+    assert((rows($again->db(), 'SELECT COUNT(*) AS n FROM leased')->rows[0]['n']->int() ?? -1) == 0);
+}
+
+#[group: 'live']
+test live_pool_drops_a_dead_connection
+{
+    mysql::Pool $p = pool(2);
+    uint32 $killed = 0;
+    {
+        mysql::Lease $l = guard $p->acquire() else ($e) {
+            die("{$e}");
+        }
+        $killed = $l->db()->id;
+        $l->db()->close();
+    }
+    assert($p->open() == 0);
+    mysql::Lease $fresh = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    assert($fresh->db()->id != $killed);
+    assert($fresh->db()->alive());
+
+    // the pool's own verbs
+    mysql::ResultSet $rs = guard $p->query('SELECT ? AS v', ['pooled']) else ($e) {
+        die("{$e}");
+    }
+    assert(($rs->rows[0]['v']->text() ?? '') == 'pooled');
+    $p->close();
+    assert($p->acquire()->failed());
+}
+
+#[end]

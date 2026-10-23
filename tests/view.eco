@@ -1,0 +1,514 @@
+/**
+ * `RowView`: a row read in place must answer exactly what the whole-row decoders do, in both
+ * protocols, and a stream read through `step()`/`view()` must leave the connection as `next()`
+ * does.
+ */
+
+use mysql::protocol::{putLenString};
+
+internal function columnsOf(const array<string>& $defs) : mysql::Columns
+{
+    array<mysql::Column> $list = array<mysql::Column>();
+    foreach ($defs as $d) {
+        mysql::Column $c = guard mysql::protocol::column($d) else ($e) {
+            die("column: {$e}");
+        }
+        $list->push($c);
+    }
+    return mysql::Columns($list);
+}
+
+internal function viewOf(const mysql::Columns& $cols, bool $binary, const string& $packet) : mysql::RowView
+{
+    mysql::RowView $v = mysql::RowView($cols, $binary);
+    guard $v->load($packet) else ($e) {
+        die("layout: {$e}");
+    }
+    return $v;
+}
+
+/**
+ * Every value of the view, one by one, against the whole-row decode of the same packet.
+ */
+internal function sameAsRow(const mysql::RowView& $v, const array<mysql::Value>& $whole) : void
+{
+    assert($v->count() == $whole->count());
+    foreach ($whole as $i => $w) {
+        mysql::Value $got = guard $v->value($i) else ($e) {
+            die("value {$i}: {$e}");
+        }
+        assert($got->kind() == $w->kind());
+        assert(str::from($got) == str::from($w));
+        assert($v->isNull($i) == $w->isNull());
+        typedAgree($v, $i, $w);
+    }
+}
+
+/**
+ * Every typed read of the view, which decodes straight from the packet, against the same read of
+ * the decoded `Value`: the two have to follow one set of rules.
+ */
+internal function typedAgree(const mysql::RowView& $v, usize $i, const mysql::Value& $w) : void
+{
+    assert(($v->int($i) == null) == ($w->int() == null) && ($v->int($i) ?? 7) == ($w->int() ?? 7), 'int agrees');
+    assert(($v->uint($i) == null) == ($w->uint() == null) && ($v->uint($i) ?? 7) == ($w->uint() ?? 7), 'uint agrees');
+    assert(($v->float($i) == null) == ($w->float() == null) && ($v->float($i) ?? 7.0) == ($w->float() ?? 7.0), 'float agrees');
+    assert(($v->bool($i) == null) == ($w->bool() == null) && ($v->bool($i) ?? false) == ($w->bool() ?? false), 'bool agrees');
+    assert(($v->text($i) == null) == ($w->text() == null) && ($v->text($i) ?? '') == ($w->text() ?? ''), 'text agrees');
+    assert(($v->bytes($i) == null) == ($w->bytes() == null) && ($v->bytes($i) ?? '') == ($w->bytes() ?? ''), 'bytes agrees');
+    assert(($v->date($i) == null) == ($w->date() == null), 'date agrees');
+    assert(($v->datetime($i) == null) == ($w->datetime() == null), 'datetime agrees');
+    assert(($v->time($i) == null) == ($w->time() == null), 'time agrees');
+    mysql::DateTime? $vd = $v->datetime($i);
+    mysql::DateTime? $wd = $w->datetime();
+    if ($vd != null && $wd != null) {
+        mysql::DateTime $a = guard $vd;
+        mysql::DateTime $b = guard $wd;
+        assert($a->year == $b->year && $a->month == $b->month && $a->day == $b->day && $a->hour == $b->hour && $a->second == $b->second && $a->micro == $b->micro, 'datetime fields agrees');
+    }
+}
+
+test a_text_row_reads_in_place
+{
+    array<string> $defs = [
+        columnDef('id', 8, mysql::protocol::FLAG_UNSIGNED),
+        columnDef('name', 253),
+        columnDef('note', 253),
+        columnDef('price', 246),
+        columnDef('born', 10),
+        columnDef('seen', 12),
+        columnDef('span', 11),
+        columnDef('avatar', 252, 0, mysql::protocol::CHARSET_BINARY),
+        columnDef('score', 5),
+        columnDef('age', 3),
+    ];
+    mysql::Columns $cols = columnsOf($defs);
+    array<string> $cells = ['18446744073709551615', 'Ada', '<NULL>', '12.34', '1815-12-10', '2026-10-21 13:14:15.000123', '-26:03:04', "\x00\x01", '1.5', '-7'];
+    string $p = textRowOf($cells);
+    mysql::RowView $v = viewOf($cols, false, $p);
+
+    array<mysql::Value> $whole = guard mysql::protocol::textRow($p, $cols) else ($e) {
+        die("{$e}");
+    }
+    sameAsRow($v, $whole);
+
+    assert(($v->uint(0) ?? 0) == 18446744073709551615);
+    // too big for int64
+    assert($v->int(0) == null);
+    assert(($v->text(1) ?? '') == 'Ada');
+    assert($v->isNull(2) && $v->text(2) == null);
+    assert(($v->text(3) ?? '') == '12.34');
+    mysql::Date $born = guard $v->date(4);
+    assert($born->year == 1815 && $born->month == 12 && $born->day == 10);
+    mysql::DateTime $seen = guard $v->datetime(5);
+    assert($seen->hour == 13 && $seen->micro == 123);
+    mysql::Time $span = guard $v->time(6);
+    assert($span->negative && $span->hours == 26 && $span->second == 4);
+    string $avatar = $v->bytes(7) ?? '';
+    assert($avatar->size() == 2 && $avatar->byte(1) == 1);
+    assert(($v->float(8) ?? 0.0) == 1.5);
+    assert(($v->int(9) ?? 0) == -7);
+    // the wrong type answers null, the right one still answers after
+    assert($v->int(1) == null && $v->bool(1) == null && $v->date(1) == null);
+    assert(($v->text(1) ?? '') == 'Ada');
+}
+
+test a_binary_row_reads_in_place
+{
+    // fourteen columns: a two-byte NULL bitmap, with NULLs at column 0, at column 6 (the first bit
+    // of the second byte) and at column 13 (its last bit)
+    array<string> $defs = [
+        columnDef('t0', 1),
+        columnDef('t1', 1),
+        columnDef('s', 2),
+        columnDef('l', 3, mysql::protocol::FLAG_UNSIGNED),
+        columnDef('q', 8),
+        columnDef('d', 5),
+        columnDef('gone', 253),
+        columnDef('price', 246),
+        columnDef('name', 253),
+        columnDef('seen', 12),
+        columnDef('span', 11),
+        columnDef('avatar', 252, 0, mysql::protocol::CHARSET_BINARY),
+        columnDef('f', 4),
+        columnDef('born', 10),
+    ];
+    mysql::Columns $cols = columnsOf($defs);
+
+    string $p = '';
+    $p->push(0);
+    // bits 2 (column 0), 8 (column 6) and 15 (column 13)
+    $p->push(4);
+    $p->push(129);
+    $p->push(255);
+    tcp::wire::putLe16($p, 300);
+    tcp::wire::putLe32($p, 4000000000);
+    tcp::wire::putLe64($p, 18446744073709551611);
+    tcp::wire::putLe64($p, 4609434218613702656);
+    putLenString($p, '12.34');
+    putLenString($p, 'Ada');
+    $p->push(11);
+    tcp::wire::putLe16($p, 2026);
+    $p->push(10);
+    $p->push(21);
+    $p->push(13);
+    $p->push(14);
+    $p->push(15);
+    tcp::wire::putLe32($p, 123);
+    $p->push(8);
+    $p->push(1);
+    tcp::wire::putLe32($p, 1);
+    $p->push(2);
+    $p->push(3);
+    $p->push(4);
+    putLenString($p, "\x00\x01");
+    tcp::wire::putLe32($p, 1056964608);
+
+    mysql::RowView $v = viewOf($cols, true, $p);
+    array<mysql::Value> $whole = guard mysql::protocol::binaryRow($p, $cols) else ($e) {
+        die("{$e}");
+    }
+    sameAsRow($v, $whole);
+
+    assert($v->isNull(0) && $v->int(0) == null);
+    assert(($v->int(1) ?? 0) == -1);
+    assert(($v->int(2) ?? 0) == 300);
+    assert(($v->uint(3) ?? 0) == 4000000000);
+    assert(($v->int(4) ?? 0) == -5);
+    assert(($v->float(5) ?? 0.0) == 1.5);
+    assert($v->isNull(6));
+    mysql::Value $price = guard $v->value(7);
+    assert($price->kind() == 'decimal' && ($v->text(7) ?? '') == '12.34');
+    assert(($v->text(8) ?? '') == 'Ada');
+    mysql::DateTime $seen = guard $v->datetime(9);
+    assert($seen->year == 2026 && $seen->second == 15 && $seen->micro == 123);
+    mysql::Time $span = guard $v->time(10);
+    assert($span->negative && $span->hours == 26 && $span->minute == 3);
+    mysql::Value $avatar = guard $v->value(11);
+    assert($avatar->kind() == 'bytes');
+    assert(($v->float(12) ?? 0.0) == 0.5);
+    assert($v->isNull(13) && $v->date(13) == null);
+
+    // read out of order, and twice
+    assert(($v->text(8) ?? '') == 'Ada' && ($v->int(1) ?? 0) == -1);
+
+    mysql::Row $row = guard $v->row();
+    assert($row->count() == 14);
+    assert(($row['name']->text() ?? '') == 'Ada');
+}
+
+test a_malformed_row_is_an_error_not_a_crash
+{
+    array<string> $defs = [columnDef('name', 253), columnDef('n', 8)];
+    mysql::Columns $cols = columnsOf($defs);
+
+    // text: the second value claims more bytes than there are
+    string $short = '';
+    putLenString($short, 'Ada');
+    $short->push(9);
+    $short->append('12');
+    mysql::RowView $t = mysql::RowView($cols, false);
+    status<mysql::Error> $laid = $t->load($short);
+    assert($laid->failed() && $laid->failure()->name() == 'malformed');
+    assert($t->count() == 0);
+
+    // binary: a LONGLONG cut short
+    string $cut = '';
+    $cut->push(0);
+    $cut->push(0);
+    putLenString($cut, 'Ada');
+    tcp::wire::putLe32($cut, 1);
+    mysql::RowView $b = mysql::RowView($cols, true);
+    assert($b->load($cut)->failed());
+
+    // a text value the column type cannot hold: the layout is fine, the read reports it
+    string $bad = textRowOf(['Ada', 'twelve']);
+    mysql::RowView $v = viewOf($cols, false, $bad);
+    assert($v->int(1) == null);
+    result<mysql::Value, mysql::Error> $read = $v->value(1);
+    assert($read->failed() && $read->failure()->name() == 'malformed');
+}
+
+test session_a_stream_read_in_place
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->send(hello('mysql_native_password'));
+        answer($w->recv());
+        $w->send(okPacket());
+
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUERY);
+        string $count = '';
+        $count->push(2);
+        $w->send($count);
+        $w->send(columnDef('id', 8));
+        $w->send(columnDef('name', 253));
+        $w->send(textRowOf(['1', 'Ada']));
+        $w->send(textRowOf(['2', '<NULL>']));
+        $w->send(textRowOf(['3', 'Grace']));
+        $w->send(okEnd());
+
+        // the connection is free again
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUERY);
+        string $one = '';
+        $one->push(1);
+        $w->send($one);
+        $w->send(columnDef('n', 8));
+        $w->send(textRowOf(['42']));
+        $w->send(okEnd());
+
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUIT);
+    });
+    mysql::Connection $db = login($f);
+    mysql::Rows $rs = guard $db->stream('SELECT id, name FROM people') else ($e) {
+        die("{$e}");
+    }
+    // positions resolved once, from the columns
+    usize $id = guard $rs->columns()->find('id');
+    usize $name = guard $rs->columns()->find('name');
+    assert($rs->view()->count() == 0);
+
+    bool $first = guard $rs->step() else ($e) {
+        die("{$e}");
+    }
+    assert($first);
+    assert(($rs->view()->int($id) ?? 0) == 1 && ($rs->view()->text($name) ?? '') == 'Ada');
+
+    // next() and step() walk the same stream
+    mysql::Row? $second = guard $rs->next() else ($e) {
+        die("{$e}");
+    }
+    mysql::Row $r = guard $second;
+    assert(($r['id']->int() ?? 0) == 2 && $r['name']->isNull());
+    // next() decodes its row without the view, which stands on no row until the next step()
+    assert($rs->view()->count() == 0);
+
+    bool $third = guard $rs->step() else ($e) {
+        die("{$e}");
+    }
+    assert($third && ($rs->view()->text($name) ?? '') == 'Grace');
+    bool $end = guard $rs->step() else ($e) {
+        die("{$e}");
+    }
+    assert(!$end);
+    guard $rs->finish() else ($e) {
+        die("{$e}");
+    }
+
+    mysql::ResultSet $after = guard $db->query('SELECT 42 AS n') else ($e) {
+        die("{$e}");
+    }
+    assert(($after[0]['n']->int() ?? 0) == 42);
+    $db->close();
+}
+
+test session_a_kept_row_outlives_the_loop
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->send(hello('mysql_native_password'));
+        answer($w->recv());
+        $w->send(okPacket());
+
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUERY);
+        string $count = '';
+        $count->push(2);
+        $w->send($count);
+        $w->send(columnDef('id', 8));
+        $w->send(columnDef('name', 253));
+        $w->send(textRowOf(['1', 'Ada Lovelace, who wrote the first program']));
+        $w->send(textRowOf(['2', 'Grace Hopper, who wrote the first compiler']));
+        $w->send(textRowOf(['3', 'Edsger Dijkstra']));
+        $w->send(okEnd());
+
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUIT);
+    });
+    mysql::Connection $db = login($f);
+    mysql::Rows $rs = guard $db->stream('SELECT id, name FROM people') else ($e) {
+        die("{$e}");
+    }
+    // foreach loads every row into one Row: one kept in an array, and a value kept on its own,
+    // have to stay what they were when the next row comes in
+    array<mysql::Row> $kept = array<mysql::Row>();
+    string $firstName = '';
+    foreach ($rs as $row) {
+        if (($row['id']->int() ?? 0) == 1) {
+            $firstName = $row['name']->text() ?? '';
+        }
+        if (($row['id']->int() ?? 0) != 3) {
+            $kept->push($row);
+        }
+    }
+    guard $rs->finish() else ($e) {
+        die("{$e}");
+    }
+    assert($kept->count() == 2);
+    assert(($kept[0]['id']->int() ?? 0) == 1 && ($kept[0]['name']->text() ?? '') == 'Ada Lovelace, who wrote the first program');
+    assert(($kept[1]['id']->int() ?? 0) == 2 && ($kept[1]['name']->text() ?? '') == 'Grace Hopper, who wrote the first compiler');
+    assert($firstName == 'Ada Lovelace, who wrote the first program');
+    // past the last row the view stands on none
+    assert($rs->view()->count() == 0);
+    $db->close();
+}
+
+test a_binary_temporal_value_of_a_bad_length_is_malformed
+{
+    array<string> $defs = [columnDef('seen', 12), columnDef('span', 11)];
+    mysql::Columns $cols = columnsOf($defs);
+
+    // a DATETIME of 5 bytes: inside the packet, but not a length the protocol has
+    string $odd = '';
+    $odd->push(0);
+    $odd->push(0);
+    $odd->push(5);
+    $odd->append('12345');
+    $odd->push(0);
+    mysql::RowView $v = mysql::RowView($cols, true);
+    status<mysql::Error> $laid = $v->load($odd);
+    assert($laid->failed() && $laid->failure()->name() == 'malformed');
+    assert($v->count() == 0);
+
+    // the same row with a TIME of 9 bytes
+    string $time = '';
+    $time->push(0);
+    $time->push(0);
+    $time->push(0);
+    $time->push(9);
+    $time->append('123456789');
+    assert($v->load($time)->failed());
+}
+
+test column_lookup_by_name
+{
+    array<string> $defs = [
+        columnDef('id', 8),
+        columnDef('created_at_utc', 12),
+        columnDef('created_at_local', 12),
+        columnDef('id', 3),
+        columnDef('', 253),
+    ];
+    mysql::Columns $cols = columnsOf($defs);
+    // the first of two equal names answers
+    assert(($cols->find('id') ?? 9) == 0);
+    // names past seven bytes, equal in the first seven
+    assert(($cols->find('created_at_utc') ?? 9) == 1);
+    assert(($cols->find('created_at_local') ?? 9) == 2);
+    assert($cols->find('created_at_other') == null);
+    assert($cols->find('created') == null);
+    assert($cols->find('i') == null && $cols->find('idx') == null);
+    assert(($cols->find('') ?? 9) == 4);
+
+    // past sixteen columns the lookup hashes, with the same answers
+    array<string> $wide = array<string>();
+    usize $i = 0;
+    while ($i < 20) {
+        $wide->push(columnDef("c{$i}", 8));
+        $i = $i + 1;
+    }
+    $wide->push(columnDef('c3', 3));
+    mysql::Columns $many = columnsOf($wide);
+    assert(($many->find('c3') ?? 99) == 3);
+    assert(($many->find('c19') ?? 99) == 19);
+    assert($many->find('c20') == null);
+}
+
+test a_view_reads_text_in_place
+{
+    array<string> $defs = [columnDef('name', 253), columnDef('n', 8), columnDef('gone', 253), columnDef('price', 246)];
+    mysql::Columns $cols = columnsOf($defs);
+    string $p = textRowOf(['Ada', '42', '<NULL>', '12.34']);
+    mysql::RowView $v = viewOf($cols, false, $p);
+    string::view $name = guard $v->view(0);
+    assert(string::from($name) == ($v->text(0) ?? ''));
+    // a number is not text, a NULL is nothing, a decimal reads as the server wrote it
+    assert($v->view(1) == null && $v->view(2) == null);
+    string::view $price = guard $v->view(3);
+    assert(string::from($price) == '12.34');
+}
+
+test a_length_cut_short_at_the_end_is_malformed
+{
+    array<string> $defs = [columnDef('a', 253), columnDef('b', 253)];
+    mysql::Columns $cols = columnsOf($defs);
+    // the second value announces a two-byte length (0xFC) with one byte left, then a three-byte
+    // one (0xFD) with two left: neither may be read past the packet
+    array<uint8> $markers = [252, 253];
+    foreach ($markers as $marker) {
+        string $p = '';
+        putLenString($p, 'Ada');
+        $p->push($marker);
+        $p->push(1);
+        mysql::RowView $t = mysql::RowView($cols, false);
+        status<mysql::Error> $laid = $t->load($p);
+        assert($laid->failed() && $laid->failure()->name() == 'malformed');
+        result<mysql::Row, mysql::Error> $row = mysql::Row::read($p, $cols, false);
+        assert($row->failed());
+    }
+}
+
+test a_long_column_name_never_answers_for_a_short_one
+{
+    // a name of 263 bytes: its size alone, kept in one byte, would wrap round to 7
+    string $long = 'created';
+    while ($long->size() < 263) {
+        $long->push(120);
+    }
+    array<string> $defs = [columnDef($long, 253), columnDef('created', 253)];
+    mysql::Columns $cols = columnsOf($defs);
+    assert(($cols->find('created') ?? 9) == 1);
+    assert(($cols->find($long) ?? 9) == 0);
+}
+
+test session_a_row_that_does_not_decode_closes_the_stream_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->send(hello('mysql_native_password'));
+        answer($w->recv());
+        $w->send(okPacket());
+
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUERY);
+        string $count = '';
+        $count->push(1);
+        $w->send($count);
+        $w->send(columnDef('n', 8));
+        $w->send(textRowOf(['1']));
+        $w->send(textRowOf(['twelve']));
+        $w->send(textRowOf(['3']));
+        $w->send(okEnd());
+    });
+    mysql::Connection $db = login($f);
+    mysql::Rows $rs = guard $db->stream('SELECT n FROM t') else ($e) {
+        die("{$e}");
+    }
+    mysql::Row? $first = guard $rs->next() else ($e) {
+        die("{$e}");
+    }
+    assert($first != null);
+    result<mysql::Row?, mysql::Error> $bad = $rs->next();
+    assert($bad->failed() && $bad->failure()->name() == 'malformed');
+    // the third row is still on the wire: nothing may read it as the next answer
+    assert(!$db->alive());
+    assert($rs->finish()->failed());
+    result<mysql::ResultSet, mysql::Error> $after = $db->query('SELECT 1');
+    assert($after->failed() && $after->failure()->name() == 'closed');
+}
+
+test session_a_row_that_does_not_decode_closes_the_query_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->send(hello('mysql_native_password'));
+        answer($w->recv());
+        $w->send(okPacket());
+
+        assert($w->recv()->byte(0) == mysql::protocol::COM_QUERY);
+        string $count = '';
+        $count->push(1);
+        $w->send($count);
+        $w->send(columnDef('n', 8));
+        $w->send(textRowOf(['twelve']));
+        $w->send(textRowOf(['2']));
+        $w->send(okEnd());
+    });
+    mysql::Connection $db = login($f);
+    result<mysql::ResultSet, mysql::Error> $bad = $db->query('SELECT n FROM t');
+    assert($bad->failed() && $bad->failure()->name() == 'malformed');
+    assert(!$db->alive());
+}

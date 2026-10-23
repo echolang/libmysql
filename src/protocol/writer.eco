@@ -1,0 +1,37 @@
+/**
+ * Appending the protocol's encodings onto a payload being built.
+ */
+
+namespace mysql::protocol;
+
+internal function putLenenc(string& $out, uint64 $v) : void
+{
+    if ($v < 251) {
+        $out->push($v as uint8);
+        return;
+    }
+    if ($v < 65536) {
+        $out->push(252);
+        tcp::wire::putLe16($out, $v as uint16);
+        return;
+    }
+    if ($v < 16777216) {
+        $out->push(253);
+        tcp::wire::putLe24($out, $v as uint32);
+        return;
+    }
+    $out->push(254);
+    tcp::wire::putLe64($out, $v);
+}
+
+internal function putLenString(string& $out, const string& $s) : void
+{
+    putLenenc($out, $s->size() as uint64);
+    $out->append($s);
+}
+
+internal function putNul(string& $out, const string& $s) : void
+{
+    $out->append($s);
+    $out->push(0);
+}

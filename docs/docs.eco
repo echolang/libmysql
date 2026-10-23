@@ -1,0 +1,46 @@
+/*
+ * libmysql's docs, built by ecodoc. From the repo root, `ecodoc build`
+ * writes the site to docs/dist.
+ */
+
+#[module: "docs"]
+
+#[docs::title: "libmysql"]
+#[docs::description: "MySQL for Echo, in Echo. No C underneath."]
+#[docs::repo: "https://github.com/echolang/libmysql"]
+#[docs::edit: "https://github.com/echolang/libmysql/edit/main/docs/{path}"]
+#[docs::source: "https://github.com/echolang/libmysql/blob/main/"]
+#[docs::url: "https://echolang.github.io/libmysql"]
+#[docs::nav: [
+    { text: "Guide", link: "/guide/" },
+    { text: "API", link: "/api/" },
+    { text: "Echo", link: "https://echoc.dev" }
+]]
+#[docs::sidebar: [{ base: "/guide/", items: [
+    { text: "Start", items: [
+        { text: "Getting started", link: "/guide/" },
+        { text: "Connecting", link: "/guide/connect" },
+        { text: "Authentication", link: "/guide/auth" }
+    ] },
+    { text: "Queries", items: [
+        { text: "Queries and results", link: "/guide/queries" },
+        { text: "Parameters", link: "/guide/params" },
+        { text: "Prepared statements", link: "/guide/statements" },
+        { text: "Values and types", link: "/guide/values" }
+    ] },
+    { text: "Reading rows", items: [
+        { text: "Streaming", link: "/guide/streaming" },
+        { text: "Reading in place", link: "/guide/rowview" }
+    ] },
+    { text: "State", items: [
+        { text: "Transactions", link: "/guide/transactions" },
+        { text: "Pool", link: "/guide/pool" },
+        { text: "Deadlines", link: "/guide/deadlines" },
+        { text: "Errors", link: "/guide/errors" }
+    ] },
+    { text: "Project", items: [
+        { text: "What isn't here", link: "/guide/limits" }
+    ] }
+] }]]
+#[docs::api: { manifest: "../module.eco", visibility: public, autolink: true }]
+#[docs::footer: { message: "MIT. Built with ecodoc." }]
