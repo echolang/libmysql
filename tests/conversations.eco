@@ -683,7 +683,13 @@ test session_a_local_file_in_a_multi_result_closes_the_connection
         assert($w->recv()->empty());
         // the empty file was taken, and another result follows
         $w->send(okPacket(0, 0, SERVER_MORE_RESULTS_EXISTS));
-        $w->sendRows(['1']);
+        // the client hangs up as soon as it sees there is more, so the rest may not get through
+        array<string> $rest = [countPacket(1), columnDef('n', 3), textRowOf(['1']), okEnd()];
+        foreach ($rest as $p) {
+            if (!$w->trySend($p)) {
+                return;
+            }
+        }
     });
     mysql::Options $o = optionsFor($f);
     $o->multiStatements = true;
@@ -703,7 +709,8 @@ test session_connect_to_nothing_is_a_transport_error
     $l->close();
     mysql::Options $o = mysql::Options($user: 'app');
     $o->port = $port;
-    $o->connectTimeout = time::duration::secs(2);
+    // Windows retries a refused connect for about two seconds before it gives up
+    $o->connectTimeout = time::duration::secs(10);
     result<mysql::Connection, mysql::Error> $r = mysql::Connection::open($o);
     assert($r->failed() && $r->failure()->name() == 'transport');
     assert(mysql::Connection::open('nope://')->failure()->name() == 'invalid');

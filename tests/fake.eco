@@ -24,13 +24,29 @@ internal class Wire
 
     internal function send(const string& $payload) : void
     {
+        guard $this->s->write($this->head($payload), $payload, tcp::Deadline(ms: 5000)) else ($e) {
+            die("fake send: {$e}");
+        }
+    }
+
+    /**
+     * Send a packet the client may hang up on: false once it has.
+     */
+    internal function trySend(const string& $payload) : bool
+    {
+        guard $this->s->write($this->head($payload), $payload, tcp::Deadline(ms: 5000)) else ($e) {
+            return false;
+        }
+        return true;
+    }
+
+    internal function head(const string& $payload) : string
+    {
         string $head = '';
         tcp::wire::putLe24($head, $payload->size() as uint32);
         $head->push($this->seq);
         $this->seq = $this->seq + 1;
-        guard $this->s->write($head, $payload, tcp::Deadline(ms: 5000)) else ($e) {
-            die("fake send: {$e}");
-        }
+        return $head;
     }
 
     /**
