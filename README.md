@@ -65,7 +65,7 @@ Here is the catch: a fresh MySQL 8 over TCP has an empty `caching_sha2_password`
 
 ## Connecting
 
-A URL names the server: `mysql://user:password@host:port/database?...`. User, password, and database are percent-decoded. Query keys: `socket`, `timeout`, `connectTimeout` (`250ms`, `5s`, `2m`), `multiStatements`, `fetchServerKey`, `statementCache`, `maxPacket`, `collation`.
+A URL names the server: `mysql://user:password@host:port/database?...`. User, password, and database are percent-decoded. Query keys: `socket`, `timeout`, `connectTimeout` (`250ms`, `5s`, `2m`), `multiStatements`, `foundRows`, `fetchServerKey`, `statementCache`, `maxPacket`, `collation`.
 
 ```echo
 mysql::Connection $db = guard mysql::Connection::open('mysql://app:secret@127.0.0.1/shop') else ($e) {

@@ -82,7 +82,7 @@ internal function greeting(const string& $payload) : result<Greeting, mysql::Err
 /**
  * The capabilities this client asks for, out of what the server offers.
  */
-internal function capabilities(uint32 $server, bool $database, bool $multiStatements) : uint32
+internal function capabilities(uint32 $server, bool $database, bool $multiStatements, bool $foundRows = false) : uint32
 {
     uint32 $want = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS
         | CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS | CLIENT_PLUGIN_AUTH
@@ -92,6 +92,9 @@ internal function capabilities(uint32 $server, bool $database, bool $multiStatem
     }
     if ($multiStatements) {
         $want = $want | CLIENT_MULTI_STATEMENTS;
+    }
+    if ($foundRows) {
+        $want = $want | CLIENT_FOUND_ROWS;
     }
     // never LOCAL_FILES, never SSL: neither is offered, whatever the server says
     return $want & $server;

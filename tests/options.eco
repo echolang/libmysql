@@ -20,7 +20,9 @@ test a_full_url
     assert($t == time::duration::secs(5));
     assert($o->connectTimeout == time::duration::millis(250));
     assert($o->multiStatements);
+    assert(!$o->foundRows);
     assert($o->statementCache == 8);
+    assert(parsed('mysql://h?foundRows=true')->foundRows);
 }
 
 test a_short_url_keeps_the_defaults
@@ -60,6 +62,7 @@ test every_query_option
     mysql::Options $o = parsed('mysql://h?fetchServerKey=1&multiStatements=0&maxPacket=1024&collation=255&connectTimeout=2m&timeout=7&socket=');
     assert($o->fetchServerKey);
     assert(!$o->multiStatements);
+    assert(!$o->foundRows);
     assert($o->maxPacket == 1024);
     assert($o->collation == 255);
     assert($o->connectTimeout == time::duration::mins(2));
@@ -74,6 +77,7 @@ test bad_query_options_are_invalid
         'mysql://h?collation=256',
         'mysql://h?maxPacket=big',
         'mysql://h?multiStatements=yes',
+        'mysql://h?foundRows=sure',
         'mysql://h?fetchServerKey=',
         'mysql://h?timeout=-5s',
         'mysql://h?timeout=ms',

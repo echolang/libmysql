@@ -161,9 +161,11 @@ test the_client_asks_only_for_what_it_speaks
     assert(($caps & mysql::protocol::CLIENT_SSL) == 0);
     assert(($caps & mysql::protocol::CLIENT_CONNECT_WITH_DB) == 0);
     assert(($caps & mysql::protocol::CLIENT_MULTI_STATEMENTS) == 0);
-    uint32 $all = capabilities(SERVER_CAPS, true, true);
+    assert(($caps & mysql::protocol::CLIENT_FOUND_ROWS) == 0);
+    uint32 $all = capabilities(SERVER_CAPS, true, true, true);
     assert(($all & mysql::protocol::CLIENT_CONNECT_WITH_DB) != 0);
     assert(($all & mysql::protocol::CLIENT_MULTI_STATEMENTS) != 0);
+    assert(($all & mysql::protocol::CLIENT_FOUND_ROWS) != 0);
     // never more than the server offers
     assert(capabilities(mysql::protocol::CLIENT_PROTOCOL_41, true, true) == mysql::protocol::CLIENT_PROTOCOL_41);
 }

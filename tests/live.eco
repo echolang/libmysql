@@ -678,4 +678,22 @@ test live_session_commands
     assert(!$db->alive());
 }
 
+#[group: 'live']
+test live_found_rows_counts_what_an_update_matched
+{
+    mysql::Connection $db = live();
+    run($db, 'DROP TABLE IF EXISTS found_rows');
+    run($db, 'CREATE TABLE found_rows (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL)');
+    run($db, "INSERT INTO found_rows VALUES (1, 'same')");
+    // by default an UPDATE that writes what the row holds touched nothing
+    assert(run($db, "UPDATE found_rows SET name = 'same' WHERE id = 1")->affectedRows == 0);
+
+    mysql::Options $o = liveOptions('MYSQL_TEST_URL');
+    $o->foundRows = true;
+    mysql::Connection $found = connect($o);
+    assert(run($found, "UPDATE found_rows SET name = 'same' WHERE id = 1")->affectedRows == 1);
+    assert(run($found, "UPDATE found_rows SET name = 'same' WHERE id = 2")->affectedRows == 0);
+    run($found, 'DROP TABLE found_rows');
+}
+
 #[end]

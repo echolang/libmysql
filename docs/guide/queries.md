@@ -62,7 +62,7 @@ A name the result does not have stops the program, in a release build too. Same 
 
 What a statement that returns no rows did:
 
-- `affectedRows` is how many it touched.
+- `affectedRows` is how many it touched. For an UPDATE that is the rows it changed; set `Options->foundRows` to count the rows it matched instead.
 - `lastInsertId` is the id an `AUTO_INCREMENT` column handed out, or 0.
 - `warnings` is the server's warning count.
 - `info` is the info line the server sent with the OK, often empty.

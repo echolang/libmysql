@@ -118,7 +118,7 @@ public class Connection
             $ch->close();
             return .error($e);
         }
-        uint32 $caps = mysql::protocol::capabilities($g->capabilities, $o->database != null, $o->multiStatements);
+        uint32 $caps = mysql::protocol::capabilities($g->capabilities, $o->database != null, $o->multiStatements, $o->foundRows);
         if (($caps & mysql::protocol::CLIENT_PROTOCOL_41) == 0) {
             $ch->close();
             return .error(.invalid('the server does not speak the 4.1 protocol'));

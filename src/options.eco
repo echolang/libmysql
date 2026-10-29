@@ -53,6 +53,13 @@ public struct Options
     public bool $multiStatements = false;
 
     /**
+     * Report the rows an UPDATE matched as `affectedRows`, not only the ones it changed. Off by
+     * default, same as MySQL's own clients. A mapper that checks an UPDATE by key found its row
+     * turns it on: without it, an UPDATE that writes the values the row already holds reports 0.
+     */
+    public bool $foundRows = false;
+
+    /**
      * The server's RSA public key (PEM), for full caching_sha2_password authentication over TCP.
      */
     public string? $serverKey = null;
@@ -71,7 +78,7 @@ public struct Options
     /**
      * Options from a URL: `mysql://user:password@host:port/database?socket=/path&timeout=5s`.
      * User, password and database are percent-decoded. Query keys: `socket`, `timeout`,
-     * `connectTimeout` (`250ms`, `5s`, `2m`), `multiStatements`, `fetchServerKey`,
+     * `connectTimeout` (`250ms`, `5s`, `2m`), `multiStatements`, `foundRows`, `fetchServerKey`,
      * `statementCache`, `maxPacket`, `collation`.
      */
     public static function parse(const string& $url) : result<Options, Error>
@@ -214,6 +221,13 @@ public struct Options
                 return .error(.invalid("multiStatements is true or false, not '{$value}'"));
             }
             $this->multiStatements = $m;
+            return .ok;
+        }
+        if ($key == 'foundRows') {
+            bool $r = guard flag($value) else {
+                return .error(.invalid("foundRows is true or false, not '{$value}'"));
+            }
+            $this->foundRows = $r;
             return .ok;
         }
         if ($key == 'fetchServerKey') {

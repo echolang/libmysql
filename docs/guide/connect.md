@@ -42,6 +42,7 @@ Every key `parse` knows, and the format it wants:
 | `timeout` | `250ms`, `5s`, `2m`, or a bare number of seconds | none, wait as long as it takes |
 | `connectTimeout` | the same duration grammar | 10 seconds |
 | `multiStatements` | `true` / `false` / `1` / `0` | `false` |
+| `foundRows` | the same flag grammar | `false` |
 | `fetchServerKey` | the same flag grammar | `false` |
 | `statementCache` | a number | 64 |
 | `maxPacket` | a number, not 0 | 64 MiB |
