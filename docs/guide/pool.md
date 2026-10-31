@@ -38,7 +38,7 @@ $pool->close();
 
 1. An idle connection that is still alive and not past `idleTimeout` / `maxLifetime`. If it has been idle longer than `pingAfterIdle`, it is pinged first, so a server that dropped it is found out here and not in the caller's first query.
 2. A new connection, while `open < max`.
-3. Wait. Waiters are served first come, first served, each handed the next connection given back. A slot that opens up (a connection closed rather than returned) lets the first waiter open a new one.
+3. Wait. Waiters are served first come, first served, each handed the next connection given back. A slot that opens up (a connection closed rather than returned) goes to the first waiter, still counted, so it opens a new one before anyone who arrives later can.
 4. `.exhausted` when none came free before the deadline.
 
 ```echo
@@ -48,7 +48,7 @@ guard $db->exec('DO 1');
 $lease->release();
 ```
 
-The lease goes back when dropped, or at `release()`. Safe to call twice. A lease dropped mid-transaction is rolled back, so the next borrower does not inherit it. A dead, busy, too old, or surplus connection is closed instead of lent.
+The lease goes back when dropped, or at `release()`. Safe to call twice, and from two threads at once: only the first call gives the connection back. `db()` after `release()` stops the program, because the connection may already be lent to another thread. A lease dropped mid-transaction is rolled back, so the next borrower does not inherit it. A dead, busy, too old, or surplus connection is closed instead of lent.
 
 ## Verbs on the pool
 
@@ -61,6 +61,23 @@ What needs `acquire()->db()`, because it holds the connection past one call:
 - `batch`, which is several results of one command.
 
 There is no `stream` / `prepare` / `batch` on the pool. That is deliberate: a stream that outlived its lease would look like a busy connection coming back, and the pool would close it.
+
+## Threads
+
+The pool and its leases may be shared by any number of threads. What a lease lends may not: the `Connection`, and the `Rows`, `Row`, `ResultSet`, `Statement`, `Transaction` and `Params` made with it, stay on the thread that holds the lease, and are let go before the lease is.
+
+```echo
+thread::task<int64> $count = guard thread::spawn(function() : int64 {
+    mysql::Lease $lease = guard $pool->acquire();
+    mysql::ResultSet $rs = guard $lease->db()->query('SELECT COUNT(*) AS n FROM products');
+    return $rs[0]['n']->int() ?? 0;
+});
+echo $count->wait();
+```
+
+Hand back plain values, as here, not the rows: a row shares its column list with the rest of its result, and that count is kept cheap, not atomic, because reading rows is the hot path.
+
+A lease dropped mid-transaction is rolled back with a deadline: the options' `timeout`, or 5 seconds. A server that does not answer in time costs the connection, not the thread giving it back.
 
 ## close
 

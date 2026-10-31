@@ -20,6 +20,7 @@ internal struct Seen
  * A server for a pool: `$refuse` turns every login after the first that many away, and `$hangUp`
  * makes the server drop a client on its first ping.
  */
+#[atomic]
 internal class Many
 {
     internal tcp::Listener $l;
@@ -439,4 +440,111 @@ test pool_shared_by_many_threads
     assert($total == 240);
     assert($p->open() <= 3);
     assert($m->seen()->logins <= 3);
+}
+
+test pool_a_lease_released_by_two_threads_goes_back_once
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(2));
+    foreach (0 .. 50 as $round) {
+        mysql::Lease $held = lease($p);
+        thread::mutex<int32> $go = thread::mutex<int32>(0);
+        array<thread::handle> $both = array<thread::handle>();
+        foreach (0 .. 2 as $n) {
+            thread::handle $h = guard thread::spawn(function() : void {
+                while (true) {
+                    thread::locked<int32> $g = $go->lock();
+                    if ($g->value == 1) {
+                        break;
+                    }
+                }
+                $held->release();
+            }) else ($e) {
+                die($e->message());
+            }
+            $both->push($h);
+        }
+        {
+            thread::locked<int32> $g = $go->lock();
+            $g->value = 1;
+        }
+        foreach ($both as $h) {
+            $h->join();
+        }
+        // given back twice, the idle list would hold the one connection twice
+        assert($p->idle() == $p->open());
+    }
+    assert($p->open() == 1);
+}
+
+#[tests: expects death]
+test pool_a_released_lease_lends_nothing
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    mysql::Lease $held = lease($p);
+    $held->release();
+    mysql::Connection $db = $held->db();
+}
+
+test pool_the_slot_of_a_dead_connection_goes_to_the_waiter_not_a_newcomer
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(1));
+    mysql::Lease $held = lease($p);
+    thread::task<bool> $waiter = guard thread::spawn(function() : bool {
+        result<mysql::Lease, mysql::Error> $l = $p->acquire(by: tcp::Deadline(ms: 5000));
+        if ($l->failed()) {
+            return false;
+        }
+        bool $alive = $l->unwrap()->db()->alive();
+        thread::sleep(300);
+        return $alive;
+    }) else ($e) {
+        die($e->message());
+    }
+    thread::sleep(100);
+    $held->db()->close();
+    $held->release();
+    // the slot went to the waiter, still counted, so a thread arriving now finds none
+    result<mysql::Lease, mysql::Error> $late = $p->acquire(by: tcp::Deadline(ms: 50));
+    assert($late->failed());
+    assert($waiter->wait());
+    assert($p->open() == 1);
+}
+
+test pool_hammered_by_many_threads
+{
+    Many $m = Many::start();
+    mysql::Pool $p = $m->pool(quiet(2));
+    array<thread::task<usize>> $workers = array<thread::task<usize>>();
+    foreach (0 .. 16 as $w) {
+        thread::task<usize> $t = guard thread::spawn(function() : usize {
+            usize $done = 0;
+            foreach (0 .. 50 as $i) {
+                mysql::Lease $l = guard $p->acquire(by: tcp::Deadline(ms: 10000)) else ($e) {
+                    die("acquire: {$e}");
+                }
+                mysql::ResultSet $rs = guard $l->db()->query('SELECT n') else ($e) {
+                    die("worker: {$e}");
+                }
+                $done = $done + $rs->count();
+                if ($i % 7 == 0) {
+                    // now and then a lease is dropped mid-transaction
+                    guard $l->db()->exec('START TRANSACTION') else ($e) { die("begin: {$e}"); }
+                }
+            }
+            return $done;
+        }) else ($e) {
+            die($e->message());
+        }
+        $workers->push($t);
+    }
+    usize $total = 0;
+    foreach ($workers as $t) {
+        $total = $total + $t->wait();
+    }
+    assert($total == 1600);
+    assert($p->open() <= 2);
+    assert($m->seen()->logins <= 2);
 }

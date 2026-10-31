@@ -82,6 +82,40 @@ test live_pool_shared_by_eight_threads
 }
 
 #[group: 'live']
+test live_pool_hammered_by_thirty_two_threads
+{
+    mysql::Pool $p = pool(4);
+    array<thread::task<int64>> $workers = array<thread::task<int64>>();
+    foreach (0 .. 32 as $w) {
+        int32 $base = $w * 1000;
+        thread::task<int64> $t = guard thread::spawn(function() : int64 {
+            int64 $sum = 0;
+            foreach (0 .. 50 as $i) {
+                int32 $n = $base + $i;
+                mysql::Lease $l = guard $p->acquire(by: tcp::Deadline(ms: 30000)) else ($e) {
+                    die("acquire: {$e}");
+                }
+                mysql::ResultSet $rs = guard $l->db()->query('SELECT CAST(? AS SIGNED) AS n, CONNECTION_ID() AS c', [$n]) else ($e) {
+                    die("worker: {$e}");
+                }
+                $sum = $sum + ($rs->rows[0]['n']->int() ?? 0);
+            }
+            return $sum;
+        }) else ($e) {
+            die($e->message());
+        }
+        $workers->push($t);
+    }
+    int64 $total = 0;
+    foreach ($workers as &$t) {
+        $total = $total + $t->wait();
+    }
+    // the sum of (1000w + i) for w < 32, i < 50
+    assert($total == 24800000 + 39200);
+    assert($p->open() <= 4);
+}
+
+#[group: 'live']
 test live_pool_rolls_back_a_lease_dropped_in_a_transaction
 {
     mysql::Pool $p = pool(1);

@@ -57,8 +57,10 @@ internal class Waiter
     internal tcp::Waker $waker;
     internal Connection? $handed;
     internal time::instant $born;
-    // woken because a slot opened up, rather than handed a connection
+    // woken to look again: the pool closed, or a slot it could not hand over opened up
     internal bool $room;
+    // handed the slot of a connection that went away: open one in its place
+    internal bool $grow;
 
     internal constructor(uint64 $ticket, tcp::Waker $waker)
     {
@@ -67,6 +69,7 @@ internal class Waiter
         $this->handed = null;
         $this->born = time::instant::now();
         $this->room = false;
+        $this->grow = false;
     }
 }
 
@@ -86,7 +89,11 @@ internal struct PoolState
  * Connections shared by many threads. `acquire` lends one out as a `Lease`, which gives it back
  * when dropped; `query`, `exec` and `transaction` do that around one call. A thread that finds
  * every connection lent out waits its turn: waiters are served first come, first served, each
- * handed the next connection given back.
+ * handed the next connection given back, or the slot of one that went away.
+ *
+ * The pool and its leases may be shared by any number of threads. What a lease lends is not:
+ * the `Connection`, and the `Rows`, `Row`, `ResultSet`, `Statement`, `Transaction` and `Params`
+ * made with it, stay on the thread holding the lease, and are let go before it is released.
  *
  * ```echo
  * mysql::Pool $p = mysql::Pool($options);
@@ -97,6 +104,9 @@ internal struct PoolState
 #[atomic]
 public class Pool
 {
+    // how long giving back a lease waits for its ROLLBACK when the options name no timeout
+    internal const time::duration ROLLBACK_TIMEOUT = time::duration::secs(5);
+
     #[docs::group: "Leasing"]
     public const Options $options;
 
@@ -187,11 +197,13 @@ public class Pool
             Connection? $handed = null;
             time::instant $born = time::instant::now();
             bool $room = false;
+            bool $slot = false;
             {
                 thread::locked<PoolState> $s = $this->state->lock();
                 $handed = $me->handed;
                 $born = $me->born;
                 $room = $me->room;
+                $slot = $me->grow;
                 // this waiter is done either way: off the queue, its waker back for reuse
                 usize $at = 0;
                 while ($at < $s->value->waiters->count()) {
@@ -207,6 +219,14 @@ public class Pool
             if ($handed != null) {
                 Connection $db = guard $handed;
                 return .ok(Lease($this, $db, $born));
+            }
+            if ($slot) {
+                // the slot is already counted for this waiter, so no newcomer can take it
+                Connection $fresh = guard Connection::open($this->options) else ($e) {
+                    $this->forget(null);
+                    return .error($e);
+                }
+                return .ok(Lease($this, $fresh, time::instant::now()));
             }
             if ($room) {
                 continue;
@@ -343,8 +363,10 @@ public class Pool
     {
         bool $healthy = $db->alive() && !$db->busy && !$this->tooOld($born);
         if ($healthy && $db->inTransaction()) {
-            // a lease dropped mid-transaction: undo it, or the next borrower inherits it
-            result<Outcome, Error> $undone = $db->exec('ROLLBACK');
+            // a lease dropped mid-transaction: undo it, or the next borrower inherits it; a server
+            // that does not answer in time costs the connection, not the thread giving it back
+            tcp::Deadline $by = tcp::Deadline(after: $this->options->timeout ?? Pool::ROLLBACK_TIMEOUT);
+            result<Outcome, Error> $undone = $db->exec('ROLLBACK', by: $by);
         }
         $this->settle($db, $born, $healthy && !$db->inTransaction() && $db->alive());
     }
@@ -354,16 +376,13 @@ public class Pool
         bool $drop = false;
         {
             thread::locked<PoolState> $s = $this->state->lock();
-            if ($s->value->closed || !$healthy) {
+            if ($s->value->closed) {
+                // close() already woke every waiter
                 $s->value->open = $s->value->open - 1;
                 $drop = true;
-                // a slot opened up: the first waiter may now open a connection of its own
-                if (!$s->value->waiters->empty()) {
-                    Waiter $w = $s->value->waiters[0];
-                    $s->value->waiters->remove(0);
-                    $w->room = true;
-                    $w->waker->wake();
-                }
+            } else if (!$healthy) {
+                $drop = true;
+                $this->pass($s->value);
             } else if (!$s->value->waiters->empty()) {
                 Waiter $w = $s->value->waiters[0];
                 $s->value->waiters->remove(0);
@@ -390,15 +409,30 @@ public class Pool
     {
         {
             thread::locked<PoolState> $s = $this->state->lock();
-            $s->value->open = $s->value->open - 1;
-            if (!$s->value->waiters->empty()) {
-                Waiter $w = $s->value->waiters[0];
-                $s->value->waiters->remove(0);
-                $w->room = true;
-                $w->waker->wake();
+            if ($s->value->closed) {
+                $s->value->open = $s->value->open - 1;
+            } else {
+                $this->pass($s->value);
             }
         }
         $db?->close();
+    }
+
+    /**
+     * The slot of a connection that is gone goes to the first waiter, still counted, so it opens
+     * a connection in its place before anyone arriving later can. With nobody waiting it is
+     * freed. Called with the lock held.
+     */
+    private function pass(PoolState& $s) : void
+    {
+        if ($s->waiters->empty()) {
+            $s->open = $s->open - 1;
+            return;
+        }
+        Waiter $w = $s->waiters[0];
+        $s->waiters->remove(0);
+        $w->grow = true;
+        $w->waker->wake();
     }
 
     private const function expired(const Idle& $i) : bool
@@ -441,6 +475,7 @@ public class Pool
 
 /**
  * A connection borrowed from a `Pool`. It goes back when the lease is dropped, or at `release()`.
+ * The lease itself may be shared between threads; the connection it lends may not.
  */
 #[atomic]
 public class Lease
@@ -448,14 +483,14 @@ public class Lease
     private Connection $db;
     private Pool $pool;
     private time::instant $born;
-    private bool $returned;
+    private atomic<bool> $returned;
 
     internal constructor(Pool $pool, Connection $db, time::instant $born)
     {
         $this->pool = $pool;
         $this->db = $db;
         $this->born = $born;
-        $this->returned = false;
+        $this->returned = atomic<bool>(false);
     }
 
     destructor()
@@ -463,20 +498,27 @@ public class Lease
         $this->release();
     }
 
+    /**
+     * The lent connection. Asking after `release()` is a bug, the connection may already
+     * belong to another thread, and stops the program.
+     */
     public function db() : Connection
     {
+        if ($this->returned->load()) {
+            die('mysql: the lease was released; its connection belongs to the pool again');
+        }
         return $this->db;
     }
 
     /**
-     * Give the connection back now. Safe to call twice.
+     * Give the connection back now. Safe to call twice, and from two threads at once: only the
+     * first call gives it back.
      */
     public function release() : void
     {
-        if ($this->returned) {
+        if ($this->returned->exchange(true)) {
             return;
         }
-        $this->returned = true;
         $this->pool->give($this->db, $this->born);
     }
 }
